@@ -111,18 +111,33 @@ buries real findings in noise.
 
 ### Multiple profiles
 
-By default the scan looks at `$CLAUDE_CONFIG_DIR`, or `~/.claude`. Tools that
-run several Claude Code profiles side by side give each one its own config dir,
-and scanning only the active one reports clean while a second profile's
-transcripts go completely unexamined.
+Tools that run several Claude Code profiles side by side give each one its own
+config dir. Scanning only one reports clean while another profile's transcripts
+go completely unexamined, so the scan covers **all** of them.
+
+Config dirs are resolved in this order, most specific first:
+
+1. `--config-dir DIR` (repeatable), or `CLAUDE_REDACT_PROFILE_DIRS`
+   (`os.pathsep`-separated)
+2. [`claude-profile`](https://github.com/deviationist/claude-profile), when
+   installed — every profile it lists, so a profile added there is picked up
+   here with no second edit
+3. `$CLAUDE_CONFIG_DIR`
+4. `~/.claude`, plus a `-personal` sibling beside it when one exists
 
 ```bash
+claude-redact                      # every profile, if claude-profile is installed
+claude-redact --active-profile     # only the one it reports as active
+claude-redact --all-profiles       # require it; fail if unavailable
 claude-redact --config-dir ~/.claude --config-dir ~/.claude-work
 ```
 
-If [`claude-profile`](https://github.com/deviationist/claude-profile) is
-installed, `--all-profiles` reads the dirs straight from its config. That is an
-optional integration, not a dependency — the tool works fine without it.
+`claude-profile` is an optional integration, never a dependency: any failure
+falls through to the next source. It is located via `$CLAUDE_PROFILE_SCRIPT`,
+then a `claude-profile` on `PATH`, then a sibling clone — the same order its
+other companion tools use, so no two can disagree about which install they mean.
+Note it is usually a **shell function**, so a Python process finds it via the
+sibling clone; set `CLAUDE_PROFILE_SCRIPT` if your checkouts are not siblings.
 
 **The full sweep is the default, and narrowing has a counter-intuitive cost.**
 The "too common" signal is measured against the corpus you scan, so a narrow

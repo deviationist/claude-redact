@@ -641,56 +641,148 @@ def info(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-PROFILE_CONFIG = Path.home() / ".config" / "claude-profile" / "config.json"
+SELF_DIR = Path(__file__).resolve().parent
+
+# Sibling tools in this family (claude-mv, claude-usage) resolve claude-profile
+# through the same three candidates in the same order, so no two of them can
+# disagree about which claude-profile they are talking to:
+#
+#   $CLAUDE_PROFILE_SCRIPT  ->  claude-profile on PATH  ->  sibling clone
+#
+# $CLAUDE_PROFILE_SCRIPT is authoritative: if the user says where it lives and
+# it is not there, it is not installed, and the others are not tried.
+#
+# Note claude-profile is a zsh FUNCTION in an interactive shell, so there is
+# usually nothing on PATH for a Python process to exec. The sibling clone is
+# what makes this work in practice; $CLAUDE_PROFILE_SCRIPT covers layouts where
+# the repos are not siblings.
 
 
-def load_profile_dirs() -> list[Path]:
-    """Config dirs declared by claude-profile, if it is installed.
+def _profile_cmd(argv: Sequence[str]) -> "str | None":
+    """Run a claude-profile subcommand. None when it is not installed."""
+    import shutil
+    import subprocess
 
-    Optional integration, not a dependency: the tool must work for people who
-    have never heard of claude-profile, so this returns [] rather than failing
-    when the config is absent or shaped differently than expected.
-    """
-    if not PROFILE_CONFIG.is_file():
-        return []
-    try:
-        data = json.loads(PROFILE_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        warn(f"ignoring unreadable {PROFILE_CONFIG}: {exc}")
-        return []
-    out: list[Path] = []
-    for name, entry in (data.get("profiles") or {}).items():
-        raw = (entry or {}).get("dir")
-        if not raw:
-            warn(f"profile {name!r} declares no dir; skipping")
+    override = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+    candidates: list[list[str]] = []
+    if override:
+        if not Path(override).is_file():
+            return None
+        candidates.append([sys.executable, override])
+    else:
+        found = shutil.which("claude-profile")
+        if found:
+            candidates.append([found])
+        sibling = SELF_DIR.parent / "claude-profile" / "claude-profile.py"
+        if sibling.is_file():
+            candidates.append([sys.executable, str(sibling)])
+
+    for base in candidates:
+        try:
+            proc = subprocess.run(
+                base + list(argv),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
             continue
-        d = Path(raw).expanduser()
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout
+    return None
+
+
+def load_profile_dirs(active_only: bool = False) -> list[Path]:
+    """Config dirs according to claude-profile; [] when it cannot answer.
+
+    `list` is documented porcelain: name<TAB>dir<TAB>active, one row per
+    profile, dir tilde-contracted. Where claude-profile is installed it is the
+    registry of config dirs, so a profile added there is picked up here with no
+    second edit - maintaining a parallel list is what invites drift.
+
+    Strictly optional: every failure path returns [] so the caller falls through
+    to CLAUDE_CONFIG_DIR and then the built-in default.
+    """
+    out = _profile_cmd(["list"])
+    if out is None:
+        return []
+    dirs: list[Path] = []
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) < 2 or not cols[1].strip():
+            continue
+        if active_only and (len(cols) < 3 or cols[2].strip() != "active"):
+            continue
+        d = Path(cols[1].strip()).expanduser()
         if d.is_dir():
-            out.append(d)
+            dirs.append(d)
         else:
-            warn(f"profile {name!r} dir does not exist: {d}")
+            warn(f"claude-profile lists a dir that does not exist: {d}")
+    return dirs
+
+
+def default_config_dirs() -> list[Path]:
+    """Fallback when claude-profile cannot answer.
+
+    Returns CLAUDE_HOME, which is $CLAUDE_CONFIG_DIR or ~/.claude, plus
+    ~/.claude-personal when that exists. Reads the module global rather than the
+    environment so that overriding CLAUDE_HOME overrides every code path.
+    """
+    out = [CLAUDE_HOME]
+    # Look for the sibling beside CLAUDE_HOME rather than under Path.home():
+    # hardcoding the real home directory would reach outside whatever config
+    # dir the caller actually asked for.
+    personal = CLAUDE_HOME.parent / f"{CLAUDE_HOME.name}-personal"
+    if personal.is_dir() and personal.resolve() != CLAUDE_HOME.resolve():
+        out.append(personal)
     return out
 
 
 def config_dirs(args: argparse.Namespace) -> list[Path]:
-    """Every Claude Code config dir this run should look at."""
+    """Every Claude Code config dir this run should look at.
+
+    Precedence, most specific first:
+      1. --config-dir, or $CLAUDE_REDACT_PROFILE_DIRS
+      2. claude-profile, when installed (all profiles; --active-profile narrows)
+      3. $CLAUDE_CONFIG_DIR
+      4. ~/.claude, plus ~/.claude-personal when it exists
+
+    All profiles rather than just the active one: a credential can sit in any of
+    them, and scanning one while reporting "clean" is the failure mode this tool
+    exists to prevent.
+    """
     roots: list[Path] = []
+
     for raw in args.config_dir or []:
         d = Path(raw).expanduser()
         if not d.is_dir():
             die(f"--config-dir is not a directory: {d}")
         roots.append(d)
-    if args.all_profiles:
-        found = load_profile_dirs()
-        if not found:
-            die(
-                "--all-profiles found no profiles; claude-profile is not "
-                "installed or declares none. Use --config-dir explicitly."
-            )
-        roots.extend(found)
+
     if not roots:
-        roots = [CLAUDE_HOME]
-    # de-duplicate by resolved path, preserving order
+        env_dirs = os.environ.get("CLAUDE_REDACT_PROFILE_DIRS", "")
+        for raw in env_dirs.split(os.pathsep):
+            if raw.strip():
+                d = Path(raw.strip()).expanduser()
+                if d.is_dir():
+                    roots.append(d)
+                else:
+                    warn(f"CLAUDE_REDACT_PROFILE_DIRS entry does not exist: {d}")
+
+    if not roots:
+        roots = load_profile_dirs(active_only=args.active_profile)
+        if args.all_profiles and not roots:
+            die(
+                "--all-profiles: claude-profile is not installed or cannot "
+                "answer. Use --config-dir, or set CLAUDE_PROFILE_SCRIPT."
+            )
+
+    if not roots:
+        if args.active_profile:
+            warn("claude-profile not installed; --active-profile has no effect")
+        roots = default_config_dirs()
+
     seen, unique = set(), []
     for r in roots:
         rp = r.resolve()
@@ -1490,7 +1582,13 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument(
         "--all-profiles",
         action="store_true",
-        help="scan every config dir declared by claude-profile, if installed",
+        help="require claude-profile resolution; fail if it is unavailable. "
+        "Scanning every profile is already the default when it is installed.",
+    )
+    scope.add_argument(
+        "--active-profile",
+        action="store_true",
+        help="only the profile claude-profile reports as active, instead of all",
     )
     scope.add_argument(
         "--path",

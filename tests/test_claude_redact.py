@@ -25,12 +25,28 @@ import claude_redact as cr  # noqa: E402
 
 
 class TempTree(unittest.TestCase):
-    """Base class giving each test an isolated directory tree."""
+    """Base class giving each test an isolated directory tree.
+
+    Also pins CLAUDE_PROFILE_SCRIPT to a path that does not exist, so no test
+    can reach the developer's real claude-profile install and scan their actual
+    ~/.claude. Tests that want profile resolution opt in via fake_profile().
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
+
+        prev = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+        os.environ["CLAUDE_PROFILE_SCRIPT"] = str(self.root / "no-claude-profile")
+
+        def restore():
+            if prev is None:
+                os.environ.pop("CLAUDE_PROFILE_SCRIPT", None)
+            else:
+                os.environ["CLAUDE_PROFILE_SCRIPT"] = prev
+
+        self.addCleanup(restore)
 
     def write(self, relpath: str, content: str) -> Path:
         p = self.root / relpath
@@ -855,9 +871,42 @@ class TestConfigDirs(TempTree):
                 code = e.code
         return code, out.getvalue(), err.getvalue()
 
-    def test_default_scans_only_the_active_config_dir(self):
-        code, _, _ = self.run_cli(["--value", "Zx9KpQm2VnLr7Wtc", "--all"])
-        self.assertEqual(code, 0, "profileB must not be scanned by default")
+    @contextlib.contextmanager
+    def fake_profile(self, rows):
+        """Stand in for a claude-profile install. rows=None means not installed."""
+        import os
+        script = self.root / "fake_profile.py"
+        if rows is None:
+            script = self.root / "definitely-absent.py"
+        else:
+            script.write_text(
+                "import sys\n"
+                f"sys.stdout.write({rows!r})\n"
+            )
+        old = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+        os.environ["CLAUDE_PROFILE_SCRIPT"] = str(script)
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROFILE_SCRIPT", None)
+            else:
+                os.environ["CLAUDE_PROFILE_SCRIPT"] = old
+
+    def test_default_without_claude_profile_uses_claude_home(self):
+        with self.fake_profile(None):
+            code, _, _ = self.run_cli(["--value", "Zx9KpQm2VnLr7Wtc", "--all"])
+        self.assertEqual(code, 0, "profileB must not be scanned without config")
+
+    def test_claude_profile_supplies_every_profile_by_default(self):
+        rows = f"personal\t{self.a}\tactive\nwork\t{self.b}\t\n"
+        with self.fake_profile(rows):
+            code, out, _ = self.run_cli(
+                ["--value", "Kx7vQm2ZpLr9WtBn", "--value", "Zx9KpQm2VnLr7Wtc",
+                 "--all", "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(json.loads(out)["findings"]), 2,
+                         "both profiles must be scanned by default")
 
     def test_config_dir_flag_reaches_another_profile(self):
         code, _, _ = self.run_cli(
@@ -891,59 +940,119 @@ class TestConfigDirs(TempTree):
         found = cr.session_targets(t, self.b)
         self.assertIn("snap@v1", {p.name for p in found})
 
-    def test_profile_dirs_absent_config_returns_empty(self):
-        orig = cr.PROFILE_CONFIG
-        cr.PROFILE_CONFIG = self.root / "no-such-config.json"
-        try:
+    def test_profile_dirs_empty_when_claude_profile_absent(self):
+        with self.fake_profile(None):
             self.assertEqual(cr.load_profile_dirs(), [])
-        finally:
-            cr.PROFILE_CONFIG = orig
 
-    def test_profile_dirs_parsed_from_config(self):
-        cfg = self.root / "profiles.json"
-        cfg.write_text(json.dumps({
-            "default_profile": "personal",
-            "profiles": {
-                "personal": {"dir": str(self.a)},
-                "work": {"dir": str(self.b)},
-                "broken": {"dir": str(self.root / "gone")},
-                "nodir": {},
-            },
-        }))
-        orig = cr.PROFILE_CONFIG
-        cr.PROFILE_CONFIG = cfg
+    def test_profile_dirs_parsed_from_list_porcelain(self):
+        rows = f"personal\t{self.a}\tactive\nwork\t{self.b}\t\n"
+        with self.fake_profile(rows):
+            dirs = cr.load_profile_dirs()
+        self.assertEqual([str(d) for d in dirs], [str(self.a), str(self.b)])
+
+    def test_active_only_selects_the_active_row(self):
+        rows = f"personal\t{self.a}\t\nwork\t{self.b}\tactive\n"
+        with self.fake_profile(rows):
+            dirs = cr.load_profile_dirs(active_only=True)
+        self.assertEqual([str(d) for d in dirs], [str(self.b)])
+
+    def test_tilde_contracted_dirs_are_expanded(self):
+        with self.fake_profile("personal\t~\tactive\n"):
+            dirs = cr.load_profile_dirs()
+        self.assertEqual([str(d) for d in dirs], [str(Path.home())])
+
+    def test_nonexistent_profile_dir_warns_and_is_dropped(self):
+        rows = f"gone\t{self.root / 'nope'}\tactive\n"
         err = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err):
-                dirs = cr.load_profile_dirs()
-        finally:
-            cr.PROFILE_CONFIG = orig
-        self.assertEqual({str(d) for d in dirs}, {str(self.a), str(self.b)})
+        with self.fake_profile(rows), contextlib.redirect_stderr(err):
+            dirs = cr.load_profile_dirs()
+        self.assertEqual(dirs, [])
         self.assertIn("does not exist", err.getvalue())
-        self.assertIn("declares no dir", err.getvalue())
 
-    def test_malformed_profile_config_is_not_fatal(self):
-        cfg = self.root / "bad.json"
-        cfg.write_text("{not json")
-        orig = cr.PROFILE_CONFIG
-        cr.PROFILE_CONFIG = cfg
-        err = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err):
-                self.assertEqual(cr.load_profile_dirs(), [])
-        finally:
-            cr.PROFILE_CONFIG = orig
-        self.assertIn("unreadable", err.getvalue())
+    def test_malformed_rows_are_ignored(self):
+        with self.fake_profile("garbage\nonlyname\t\t\n"):
+            self.assertEqual(cr.load_profile_dirs(), [])
 
-    def test_all_profiles_errors_when_none_declared(self):
-        orig = cr.PROFILE_CONFIG
-        cr.PROFILE_CONFIG = self.root / "absent.json"
-        try:
+    def test_all_profiles_errors_when_unavailable(self):
+        with self.fake_profile(None):
             code, _, err = self.run_cli(["--value", "x", "--all-profiles"])
-        finally:
-            cr.PROFILE_CONFIG = orig
         self.assertEqual(code, 2)
-        self.assertIn("no profiles", err)
+        self.assertIn("not installed", err)
+
+    def test_precedence_config_dir_beats_claude_profile(self):
+        rows = f"personal\t{self.b}\tactive\n"
+        with self.fake_profile(rows):
+            code, _, _ = self.run_cli(
+                ["--value", "Zx9KpQm2VnLr7Wtc", "--all", "--config-dir", str(self.a)])
+        self.assertEqual(code, 0, "--config-dir must win over claude-profile")
+
+    def test_precedence_env_var_beats_claude_profile(self):
+        import os
+        rows = f"personal\t{self.a}\tactive\n"
+        old = os.environ.get("CLAUDE_REDACT_PROFILE_DIRS")
+        os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = str(self.b)
+        try:
+            with self.fake_profile(rows):
+                code, _, _ = self.run_cli(["--value", "Zx9KpQm2VnLr7Wtc", "--all"])
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_REDACT_PROFILE_DIRS", None)
+            else:
+                os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = old
+        self.assertEqual(code, 1, "env var must win over claude-profile")
+
+    def test_falls_back_to_claude_home(self):
+        """CLAUDE_HOME is $CLAUDE_CONFIG_DIR or ~/.claude, resolved at import."""
+        cr.CLAUDE_HOME = self.b
+        with self.fake_profile(None):
+            dirs = cr.default_config_dirs()
+        self.assertEqual([str(d) for d in dirs], [str(self.b)])
+
+    def test_claude_config_dir_env_feeds_claude_home(self):
+        import os, importlib
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.b)
+        try:
+            reloaded = importlib.reload(cr)
+            self.assertEqual(reloaded.CLAUDE_HOME, self.b)
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
+            importlib.reload(cr)
+
+    def test_personal_sibling_is_found_beside_the_config_dir(self):
+        sibling = self.a.parent / f"{self.a.name}-personal"
+        sibling.mkdir()
+        cr.CLAUDE_HOME = self.a
+        dirs = cr.default_config_dirs()
+        self.assertIn(sibling, dirs)
+
+    def test_fallback_does_not_reach_the_real_home_directory(self):
+        """Regression: it appended ~/.claude-personal from the developer's real
+        home into a result built entirely from fixture paths."""
+        cr.CLAUDE_HOME = self.a
+        dirs = cr.default_config_dirs()
+        for d in dirs:
+            self.assertTrue(
+                str(d).startswith(str(self.root)),
+                f"{d} escapes the fixture tree",
+            )
+
+    def test_profile_script_override_is_authoritative(self):
+        """If the user says where claude-profile lives and it is not there, it
+        is not installed - the other candidates must not be tried."""
+        import os
+        old = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+        os.environ["CLAUDE_PROFILE_SCRIPT"] = str(self.root / "absent.py")
+        try:
+            self.assertIsNone(cr._profile_cmd(["list"]))
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROFILE_SCRIPT", None)
+            else:
+                os.environ["CLAUDE_PROFILE_SCRIPT"] = old
 
 
 # ---------------------------------------------------------------------------

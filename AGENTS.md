@@ -10,7 +10,7 @@ milestone two and does not exist yet; do not describe it as if it does.
 |---|---|
 | `claude-redact` | Executable shim. Wires argv to `main()`, nothing else. |
 | `claude_redact.py` | All logic. Kept importable so the tests can reach it — this is why the shim exists. |
-| `tests/test_claude_redact.py` | 139 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
+| `tests/test_claude_redact.py` | 150 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
 
 No dependencies, and it should stay that way. PyYAML is used **if importable**
 and otherwise falls through to the line scanner — never add it as a requirement.
@@ -145,10 +145,33 @@ only the active one reports clean while another profile goes unexamined.
 `session_targets` therefore takes its root explicitly — resolving `file-history/`
 against the module-level `CLAUDE_HOME` would silently look in the wrong profile.
 
-`load_profile_dirs()` reads `claude-profile`'s config when present. It is an
-**optional integration, never a dependency**: it returns `[]` for an absent or
-malformed config and warns rather than failing, so the tool works for people who
-have never heard of that project.
+`load_profile_dirs()` shells out to `claude-profile list` — documented porcelain,
+`name<TAB>dir<TAB>active`, tilde-contracted — rather than parsing its config
+file. Where that tool is installed it *is* the registry of config dirs, and
+parsing its JSON would duplicate a schema that is not ours to depend on.
+
+`_profile_cmd` locates it through the same three candidates in the same order as
+the sibling tools (`$CLAUDE_PROFILE_SCRIPT` → `PATH` → sibling clone), so no two
+of them can disagree about which install they mean. `$CLAUDE_PROFILE_SCRIPT` is
+**authoritative**: if it is set and missing, claude-profile is "not installed"
+and the other candidates are not tried. Because claude-profile is normally a zsh
+*function*, `shutil.which` usually finds nothing and the sibling clone is what
+makes this work from Python.
+
+It is an **optional integration, never a dependency**: every failure path
+returns `[]` and falls through to `$CLAUDE_CONFIG_DIR`, then `CLAUDE_HOME`.
+
+`default_config_dirs()` reads the module-level `CLAUDE_HOME`, not the
+environment, so overriding that global overrides every path. It looks for the
+`-personal` sibling *beside* `CLAUDE_HOME` rather than under `Path.home()` —
+hardcoding the real home reached outside the requested config dir and leaked
+into test fixtures.
+
+**Test isolation:** `TempTree.setUp` pins `CLAUDE_PROFILE_SCRIPT` to a
+nonexistent path so no test can reach a developer's real claude-profile and scan
+their actual `~/.claude`. Before that pin, the suite hung for minutes scanning
+527 MB of real transcripts. Tests that want profile resolution opt in with
+`fake_profile()`.
 
 ## Where a session's data actually lives
 
