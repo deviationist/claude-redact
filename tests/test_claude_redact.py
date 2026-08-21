@@ -110,6 +110,13 @@ class TestClassification(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.classify(key, "Kx7vQm2ZpLr9WtBn").verdict, "redact")
 
+    def test_compose_structural_keys_are_benign(self):
+        for key, value in (("services.mosquitto.image", "eclipse-mosquitto:2"),
+                           ("services.mqttx-web.image", "emqx/mqttx-web:latest"),
+                           ("services.app.restart", "unless-stopped")):
+            with self.subTest(key=key):
+                self.assertEqual(self.classify(key, value, hits=20).verdict, "skip")
+
     def test_docker_volume_specs_are_structural(self):
         for v in ("ollama_data:/root/.ollama", "/srv/data:/data:ro",
                   "./config:/etc/app", "${PWD}/x:/x"):

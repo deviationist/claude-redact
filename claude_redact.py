@@ -75,7 +75,11 @@ BENIGN_KEY_RE = re.compile(
     r"port|host|hostname|addr|address|url|uri|path|dir|file|name|user(?:name)?|"
     r"tz|timezone|lang|locale|log_?level|debug|env|environment|version|"
     r"puid|pgid|uid|gid|umask|timeout|retries|interval|enabled?|disabled?|"
-    r"driver|dialect|scheme|protocol|type|mode|format|charset|collation"
+    r"driver|dialect|scheme|protocol|type|mode|format|charset|collation|"
+    # compose/k8s structural keys - the leaf names a knob, never a secret
+    r"image|command|entrypoint|container_name|volumes|networks|ports|"
+    r"depends_on|restart|labels|cap_add|cap_drop|devices|healthcheck|"
+    r"working_dir|profiles|replicas|platform|pull_policy|shm_size"
     r")(?:$|[._\-/])",
     re.IGNORECASE,
 )
@@ -217,7 +221,7 @@ class Candidate:
         if ent >= 3.2 and len(v) >= 16 and charset_classes(v) >= 2 and self.hits <= 10:
             self.verdict, self.reason = "redact", f"entropy {ent:.1f}"
             return
-        if benign_key and ent < 3.5:
+        if benign_key and ent < 4.5:
             self.verdict, self.reason = "skip", "benign key name"
             return
 
@@ -731,6 +735,7 @@ CONFIG_GLOBS = (
     "credentials.json", "credentials.yml", "credentials.yaml",
     "secrets.json", "secrets.yml", "secrets.yaml", "secrets.toml",
     ".netrc", "_netrc", ".pgpass", ".my.cnf", "msmtprc", ".msmtprc",
+    "passwd", "pwfile", "password_file", "htpasswd", ".htpasswd",
     ".npmrc", ".pypirc", ".dockercfg", ".boto",
     "application.properties", "application.yml", "application.yaml",
     "settings.py", "local_settings.py", "wp-config.php",
