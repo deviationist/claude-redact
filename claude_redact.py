@@ -97,6 +97,10 @@ DURATION_RE = re.compile(r"^\d+(?:ms|s|m|h|d|w|[kmgt]i?b?)$", re.IGNORECASE)
 PATH_RE = re.compile(r"^(?:\.{0,2}/|~/|[a-z]:\\)")
 TZ_RE = re.compile(r"^[A-Z][a-z]+/[A-Z]")
 IMAGE_REF_RE = re.compile(r"^[a-z0-9._\-]+(?:/[a-z0-9._\-]+)+:[a-z0-9._\-]+$")
+# Docker volume/bind specs: "named_vol:/in/container", "/on/host:/in/container".
+VOLUME_SPEC_RE = re.compile(r"^[\w./\-${}]+:/[\w./\-]+(?::(?:ro|rw|z|Z|r?slave|r?shared))?$")
+# Linux capability lists (cap_add), e.g. NET_ADMIN or SYS_ADMIN,NET_RAW.
+CAP_LIST_RE = re.compile(r"^[A-Z][A-Z_]{2,}(?:,[A-Z][A-Z_]{2,})*$")
 SEMVER_RE = re.compile(r"^v?\d+\.\d+(?:\.\d+)?(?:[.\-+][\w.\-]+)?$")
 
 
@@ -128,6 +132,8 @@ def looks_structural(value: str) -> bool:
         or TZ_RE.match(v)
         or IMAGE_REF_RE.match(v)
         or SEMVER_RE.match(v)
+        or VOLUME_SPEC_RE.match(v)
+        or CAP_LIST_RE.match(v)
     )
 
 
@@ -154,13 +160,26 @@ class Candidate:
     def placeholder(self) -> str:
         return f"[REDACTED:{self.label}]"
 
+    @property
+    def leaf_key(self) -> str:
+        """Final segment of a dotted key path.
+
+        Matching the whole path is wrong: a compose service named `ollama-auth`
+        makes every key beneath it - image, cap_add, volumes, container_name -
+        look like a credential because the path contains "auth". Only the leaf
+        names the value.
+        """
+        leaf = re.split(r"[.\[]", self.key)[-1] if self.key else ""
+        return leaf or self.key
+
     def classify(self, min_length: int) -> None:
         v = self.value
         low = v.strip().lower()
         ent = entropy(v)
 
-        strong_key = bool(SECRET_KEY_RE.search(self.key))
-        benign_key = bool(BENIGN_KEY_RE.search(self.key)) and not strong_key
+        leaf = self.leaf_key
+        strong_key = bool(SECRET_KEY_RE.search(leaf))
+        benign_key = bool(BENIGN_KEY_RE.search(leaf)) and not strong_key
 
         if self.hits == 0:
             self.verdict, self.reason = "skip", "not present"
@@ -187,7 +206,13 @@ class Candidate:
             return
 
         if strong_key and len(v) >= min_length:
-            self.verdict, self.reason = "redact", "credential key name"
+            # Even a credential-named key is implausible at this spread; a real
+            # secret does not appear in dozens of unrelated files.
+            if self.hits > 100 and self.files > 10:
+                self.verdict, self.reason = (
+                    "review", f"credential key but {self.hits} hits in {self.files} files")
+            else:
+                self.verdict, self.reason = "redact", "credential key name"
             return
         if ent >= 3.2 and len(v) >= 16 and charset_classes(v) >= 2 and self.hits <= 10:
             self.verdict, self.reason = "redact", f"entropy {ent:.1f}"

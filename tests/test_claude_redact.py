@@ -91,6 +91,43 @@ class TestClassification(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.classify(key, "Kx7vQm2ZpLr9WtBn").verdict, "redact")
 
+    def test_service_name_does_not_credentialise_its_keys(self):
+        """Regression: a compose service named `ollama-auth` made every key
+        beneath it (image, cap_add, volumes, container_name) score as a
+        credential, because "auth" appeared in the dotted path."""
+        for key, value in (
+            ("services.ollama-auth.image", "ollama/ollama:latest"),
+            ("services.ollama-auth.container_name", "ollama-auth"),
+            ("services.ollama-auth.cap_add", "NET_ADMIN"),
+            ("services.ollama-auth.volumes[0]", "ollama_data:/root/.ollama"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(self.classify(key, value, hits=50).verdict, "skip")
+
+    def test_leaf_key_still_detects_real_credentials(self):
+        for key in ("services.api.environment.R2_SECRET_KEY",
+                    "services.db.environment.POSTGRES_PASSWORD"):
+            with self.subTest(key=key):
+                self.assertEqual(self.classify(key, "Kx7vQm2ZpLr9WtBn").verdict, "redact")
+
+    def test_docker_volume_specs_are_structural(self):
+        for v in ("ollama_data:/root/.ollama", "/srv/data:/data:ro",
+                  "./config:/etc/app", "${PWD}/x:/x"):
+            with self.subTest(v=v):
+                self.assertTrue(cr.looks_structural(v), f"{v!r} should be structural")
+
+    def test_capability_lists_are_structural(self):
+        self.assertTrue(cr.looks_structural("NET_ADMIN"))
+        self.assertTrue(cr.looks_structural("SYS_ADMIN,NET_RAW"))
+
+    def test_implausible_spread_downgrades_to_review(self):
+        c = cr.Candidate(key="AUTH_MODE", value="localhost", hits=447, files=23)
+        c.classify(8)
+        self.assertEqual(c.verdict, "skip")
+        c = cr.Candidate(key="API_SECRET", value="Kx7vQm2ZpLr9", hits=447, files=23)
+        c.classify(8)
+        self.assertEqual(c.verdict, "review")
+
     def test_stoplist_values_skipped(self):
         for value in ("admin", "true", "localhost", "postgres", "production"):
             with self.subTest(value=value):
