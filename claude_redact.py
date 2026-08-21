@@ -714,18 +714,23 @@ def resolve_targets(args: argparse.Namespace) -> list[Path]:
     else:
         proj = CLAUDE_HOME / "projects" / encode_cwd(Path.cwd().resolve())
         newest = _newest(list(proj.glob("*.jsonl"))) if proj.is_dir() else None
-        if newest is None:
-            # A credential defined here may well have leaked in a session run
-            # from somewhere else entirely, so an empty local scope is a reason
-            # to widen rather than to give up.
-            warn(
-                "no transcripts for this directory - sweeping all of "
-                f"{CLAUDE_HOME} instead (--session UUID to narrow)"
-            )
+        if args.here and newest is not None:
+            targets.extend(session_targets(newest))
+        else:
+            if args.here:
+                warn("no transcripts for this directory - sweeping everything")
+            # Default: the whole tree. Two reasons, both measured on real data.
+            #
+            # A credential defined in one project is routinely leaked by a
+            # session run somewhere else: values from a project .env turned up
+            # in 24 and 54 unrelated transcripts on a live host.
+            #
+            # More subtly, the "too common" signal is relative to the corpus
+            # scanned, so a narrow scope has too little evidence to dismiss
+            # ordinary tokens - scoping down produced MORE false positives than
+            # a full sweep, which is the opposite of what a user expects.
             for name in SWEEP_DIRS:
                 targets.extend(iter_files(CLAUDE_HOME / name))
-        else:
-            targets.extend(session_targets(newest))
 
     for extra in args.path or []:
         p = Path(extra).expanduser()
@@ -1372,7 +1377,16 @@ def build_parser() -> argparse.ArgumentParser:
     scope = p.add_argument_group("where to look")
     scope.add_argument("--session", metavar="UUID", help="a specific session id")
     scope.add_argument(
-        "--all", action="store_true", help=f"sweep everything under {CLAUDE_HOME}"
+        "--all",
+        action="store_true",
+        help=f"sweep everything under {CLAUDE_HOME} (this is the default)",
+    )
+    scope.add_argument(
+        "--here",
+        action="store_true",
+        help="only this directory's newest session. Faster, but note that the "
+        "'too common' signal needs a broad corpus to work - a narrow scope "
+        "reports more false positives, not fewer",
     )
     scope.add_argument(
         "--path",

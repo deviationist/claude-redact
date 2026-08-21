@@ -685,6 +685,40 @@ class TestCLI(TempTree):
         self.assertEqual(code, 1)
         self.assertIn("MYSQL_PASSWORD", out)
 
+    def test_default_scope_is_the_whole_tree(self):
+        """A credential defined in one project is routinely leaked from another,
+        and the 'too common' signal needs a broad corpus to work at all."""
+        import os
+        other = self.claude_home / "projects" / "-somewhere-else"
+        other.mkdir(parents=True, exist_ok=True)
+        (other / "cccc-dddd.jsonl").write_text(
+            json.dumps({"message": "leaked Kx7vQm2ZpLr9WtBn"}) + "\n")
+        proj = self.root / "proj3"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text("MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")
+        cwd = os.getcwd()
+        os.chdir(proj)
+        try:
+            code, out, _ = self.run_cli([])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 1, "should find the value in an unrelated project")
+        self.assertIn("MYSQL_PASSWORD", out)
+
+    def test_here_narrows_to_current_directory(self):
+        import os
+        self.transcript("nothing here")
+        proj = self.root / "proj4"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text("MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")
+        cwd = os.getcwd()
+        os.chdir(proj)
+        try:
+            _, _, err = self.run_cli(["--here"])
+        finally:
+            os.chdir(cwd)
+        self.assertIn("no transcripts for this directory", err)
+
     def test_benign_rows_hidden_unless_verbose(self):
         proj = self.root / "proj2"
         proj.mkdir(exist_ok=True)

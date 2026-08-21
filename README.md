@@ -102,10 +102,20 @@ buries real findings in noise.
 
 | Flag | Scans |
 |---|---|
-| *(default)* | The newest transcript for the current directory, plus everything else belonging to that session (see below). If the directory has no sessions, falls back to `--all` — a credential defined here may have leaked from elsewhere |
-| `--session UUID` | One specific session, same coverage |
-| `--all` | Everything under `~/.claude`: `projects/`, `file-history/`, `history.jsonl`, `paste-cache/`, `shell-snapshots/`, `backups/`, `debug/`, `todos/` |
+| *(default)*, `--all` | Everything under `~/.claude`: `projects/`, `file-history/`, `history.jsonl`, `paste-cache/`, `shell-snapshots/`, `backups/`, `debug/`, `todos/` |
+| `--session UUID` | One specific session and everything belonging to it |
+| `--here` | Only the current directory's newest session |
 | `--path P` | Any extra file or directory (repeatable) — combine with any of the above |
+
+**The full sweep is the default, and narrowing has a counter-intuitive cost.**
+The "too common" signal is measured against the corpus you scan, so a narrow
+scope has too little evidence to dismiss ordinary tokens and reports *more*
+false positives, not fewer. On a real host, one project scanned alone produced
+three findings; the same configs swept against the whole tree came back clean,
+because values like `REGISTRY` turned out to appear 453 times across 24 files.
+
+Values also travel: a credential defined in one project is routinely leaked by a
+session run somewhere else entirely.
 
 A session is more than its `.jsonl`. Three locations are searched together:
 
