@@ -1,8 +1,7 @@
 # claude-redact — agent notes
 
-Scanner for credentials that have leaked into Claude Code's local state
-(`~/.claude/`). **Read-only in 0.1.0** — it never modifies anything. Redaction is
-milestone two and does not exist yet; do not describe it as if it does.
+Finds credentials that have leaked into Claude Code's local state (`~/.claude/`)
+and removes them. Scanning is the default; `--redact` is the destructive path.
 
 ## Layout
 
@@ -10,7 +9,7 @@ milestone two and does not exist yet; do not describe it as if it does.
 |---|---|
 | `claude-redact` | Executable shim. Wires argv to `main()`, nothing else. |
 | `claude_redact.py` | All logic. Kept importable so the tests can reach it — this is why the shim exists. |
-| `tests/test_claude_redact.py` | 150 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
+| `tests/test_claude_redact.py` | 194 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
 
 No dependencies, and it should stay that way. PyYAML is used **if importable**
 and otherwise falls through to the line scanner — never add it as a requirement.
@@ -207,6 +206,37 @@ inferred from documentation.
   terminal.
 - Compose `environment` may be a YAML list, giving `PUID=1000` as one opaque
   value with the key name lost. `ENV_ASSIGN_RE` splits those back into pairs.
+
+## Redaction invariants
+
+The destructive path. Its tests are the densest in the suite; keep it that way.
+
+**In place, never write-and-rename.** Claude Code holds the active transcript
+open for append. A rename leaves that descriptor writing into an unlinked inode
+and silently loses the rest of the session. `redact_file` opens `r+b`, writes,
+truncates — same inode, same mode. `test_inode_is_preserved` pins this.
+
+**A JSONL line without a hit must come out byte-identical.** Lines with a hit
+take the raw path where the value has no JSON-escapable characters, so the rest
+of the line is untouched; only values that a raw search cannot find are parsed
+and re-serialised, because `json.dumps` need not reproduce the original exactly.
+
+**Bytes round-trip.** Read/write is binary with `surrogateescape`, so a file
+containing undecodable bytes is rewritten unchanged apart from the value.
+
+**No undo store, ever.** A file holding every secret ever redacted, in one
+predictable path, is worse than the leak it cleans. The journal records file,
+key names and counts — no values, and no hashes either, since a SHA-256 of a
+weak password is brute-forceable.
+
+**Verify after writing, over the whole config dir**, not just the files that
+were rewritten. The question is "is it gone", not "is it gone from the files I
+chose". This is what turns coverage from an assumption into a readable result.
+
+**Refuse a live session** unless forced, and **refuse non-interactive runs**
+without `--yes`. A plain `StringIO` reports `isatty()` False, so tests exercising
+the prompt need a fake that claims otherwise — otherwise they silently test the
+refusal path instead.
 
 ## Scope of the project
 

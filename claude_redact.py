@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 
@@ -1401,6 +1401,188 @@ def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) 
 
 
 # ---------------------------------------------------------------------------
+# redaction
+# ---------------------------------------------------------------------------
+#
+# Destructive and irreversible by design. An undo store would have to hold every
+# secret ever redacted, in one predictable path - strictly worse than the leak
+# being cleaned, which is one string buried in a large tree. The dry run and the
+# confirmation prompt are the safety net instead.
+#
+# This does NOT un-send anything: a value in a transcript already went to the
+# API. It stops the value being re-read by future sessions and removes it from
+# anything that backs up or syncs the home directory.
+
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+) / "claude-redact"
+JOURNAL = STATE_DIR / "journal.jsonl"
+
+
+@dataclass
+class Replacement:
+    """One value to remove, and what to put in its place."""
+
+    value: str
+    placeholder: str
+    key: str
+
+
+@dataclass
+class FileEdit:
+    path: Path
+    count: int = 0
+    per_key: dict[str, int] = field(default_factory=dict)
+
+
+def _replace_in_text(text: str, reps: Sequence[Replacement]) -> tuple[str, dict[str, int]]:
+    counts: dict[str, int] = {}
+    for r in reps:
+        n = text.count(r.value)
+        if n:
+            text = text.replace(r.value, r.placeholder)
+            counts[r.key] = counts.get(r.key, 0) + n
+    return text, counts
+
+
+def _replace_in_jsonl(text: str, reps: Sequence[Replacement]) -> tuple[str, dict[str, int]]:
+    """Rewrite only the lines that actually contain a value.
+
+    Lines without a hit are preserved byte-for-byte. A value containing
+    characters JSON escapes cannot be found by a raw search, so those lines are
+    parsed, walked and re-serialised; every other line takes the raw path, which
+    leaves the rest of the line untouched rather than round-tripping it through
+    a serialiser that may not reproduce it exactly.
+    """
+    needs_parse = [r for r in reps if _NEEDS_PARSE_RE.search(r.value)]
+    plain = [r for r in reps if not _NEEDS_PARSE_RE.search(r.value)]
+
+    out_lines: list[str] = []
+    counts: dict[str, int] = {}
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\n")
+        newline = line[len(stripped):]
+        touched = stripped
+        if plain:
+            touched, c = _replace_in_text(touched, plain)
+            for k, v in c.items():
+                counts[k] = counts.get(k, 0) + v
+        if needs_parse and stripped.strip():
+            try:
+                doc = json.loads(touched)
+            except (json.JSONDecodeError, ValueError):
+                touched, c = _replace_in_text(touched, needs_parse)
+                for k, v in c.items():
+                    counts[k] = counts.get(k, 0) + v
+            else:
+                doc, c = _replace_in_obj(doc, needs_parse)
+                if c:
+                    touched = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                    for k, v in c.items():
+                        counts[k] = counts.get(k, 0) + v
+        out_lines.append(touched + newline)
+    return "".join(out_lines), counts
+
+
+def _replace_in_obj(obj, reps: Sequence[Replacement], counts=None):
+    if counts is None:
+        counts = {}
+    if isinstance(obj, str):
+        new, c = _replace_in_text(obj, reps)
+        for k, v in c.items():
+            counts[k] = counts.get(k, 0) + v
+        return new, counts
+    if isinstance(obj, dict):
+        return ({_replace_in_obj(k, reps, counts)[0] if isinstance(k, str) else k:
+                 _replace_in_obj(v, reps, counts)[0] for k, v in obj.items()}, counts)
+    if isinstance(obj, list):
+        return ([_replace_in_obj(v, reps, counts)[0] for v in obj], counts)
+    return obj, counts
+
+
+def redact_file(path: Path, reps: Sequence[Replacement], dry_run: bool) -> FileEdit:
+    """Rewrite one file in place. Returns what changed (or would change)."""
+    edit = FileEdit(path=path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        warn(f"cannot read {path}: {exc}")
+        return edit
+
+    # surrogateescape round-trips bytes that are not valid UTF-8, so a file with
+    # undecodable content is rewritten byte-identically apart from the value.
+    text = raw.decode("utf-8", errors="surrogateescape")
+    if path.suffix == ".jsonl":
+        new_text, counts = _replace_in_jsonl(text, reps)
+    else:
+        new_text, counts = _replace_in_text(text, reps)
+
+    edit.per_key = counts
+    edit.count = sum(counts.values())
+    if not edit.count or dry_run:
+        return edit
+
+    data = new_text.encode("utf-8", errors="surrogateescape")
+    try:
+        # Truncate in place rather than write-and-rename. Claude Code holds the
+        # active transcript open for append; a rename leaves that descriptor
+        # writing into an unlinked inode and silently loses the rest of the
+        # session. In-place keeps the same inode, and the mode with it.
+        with open(path, "r+b") as fh:
+            fh.write(data)
+            fh.truncate()
+    except OSError as exc:
+        warn(f"cannot write {path}: {exc}")
+        edit.count = 0
+        edit.per_key = {}
+    return edit
+
+
+def write_journal(edits: Sequence[FileEdit]) -> None:
+    """Record what was touched. Values are deliberately absent.
+
+    A journal holding the originals would be an undo store by another name, and
+    a single file containing every secret ever redacted is worse than the leak.
+    No hashes either: a SHA-256 of a weak password is brute-forceable.
+    """
+    rows = [
+        {"file": str(e.path), "keys": e.per_key, "count": e.count}
+        for e in edits
+        if e.count
+    ]
+    if not rows:
+        return
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(JOURNAL, "a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        JOURNAL.chmod(0o600)
+    except OSError as exc:
+        warn(f"could not write journal: {exc}")
+
+
+def verify_removed(
+    reps: Sequence[Replacement], roots: Sequence[Path], extra: Sequence[Path]
+) -> dict[str, list[Path]]:
+    """Re-scan everything for the values just removed.
+
+    Runs over the whole of each config dir regardless of the scope that was
+    redacted: the point is to answer "is it gone?", not "is it gone from the
+    files I happened to choose". Turns coverage from a design assumption into a
+    result the user can read.
+    """
+    targets: list[Path] = []
+    for root in roots:
+        targets.extend(iter_files(root))
+    for p in extra:
+        targets.extend(iter_files(p))
+    values = [r.value for r in reps]
+    res = scan(targets, values)
+    return {v: res.locations[v] for v in values if res.counts.get(v)}
+
+
+# ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
 
@@ -1600,6 +1782,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="additional file or directory to include (repeatable)",
     )
 
+    act = p.add_argument_group("acting on findings")
+    act.add_argument(
+        "--redact",
+        action="store_true",
+        help="replace each confirmed value with [REDACTED:KEY_NAME] in place. "
+        "Destructive and irreversible - there is no undo store, by design.",
+    )
+    act.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --redact: show exactly what would change, write nothing",
+    )
+    act.add_argument(
+        "--yes",
+        action="store_true",
+        help="with --redact: do not prompt for confirmation",
+    )
+    act.add_argument(
+        "--include-review",
+        action="store_true",
+        help="also redact candidates marked 'review', not only 'redact'",
+    )
+    act.add_argument(
+        "--force",
+        action="store_true",
+        help="redact even a session that looks live. Its context still holds "
+        "the value and may write it back, so the pass is best-effort.",
+    )
+
     tune = p.add_argument_group("tuning")
     tune.add_argument(
         "--key-pattern",
@@ -1651,6 +1862,104 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--json", action="store_true", help="machine-readable output")
     out.add_argument("--version", action="version", version=f"claude-redact {__version__}")
     return p
+
+
+def _do_redact(
+    args: argparse.Namespace,
+    cands: Sequence[Candidate],
+    res: ScanResult,
+    targets: Sequence[Path],
+) -> int:
+    """Plan, confirm, rewrite, then verify."""
+    if args.value:
+        # An explicitly supplied value needs no classifier opinion: the user has
+        # already said what it is.
+        chosen = [c for c in cands if c.hits > 0]
+    else:
+        wanted = {"redact", "review"} if args.include_review else {"redact"}
+        chosen = [c for c in cands if c.hits > 0 and c.verdict in wanted]
+
+    if not chosen:
+        print(_c("1;32", "nothing to redact") + " — no confirmed findings")
+        return 0
+
+    reps = [
+        Replacement(value=c.value, placeholder=c.placeholder, key=c.label)
+        for c in chosen
+    ]
+    files = sorted({p for c in chosen for p in res.locations[c.value]})
+
+    print()
+    print(_c("1", "planned redaction"))
+    for c in chosen:
+        print(
+            f"  {c.key[:34]:<34} {c.hits:>5} occurrence(s) in "
+            f"{len(res.locations[c.value])} file(s) -> {c.placeholder}"
+        )
+    print()
+    for f in files:
+        try:
+            shown = Path("~") / f.relative_to(Path.home())
+        except ValueError:
+            shown = f
+        print(f"  {shown}")
+
+    live = [f for f in files if f.suffix == ".jsonl" and is_active(f)]
+    if live and not args.force:
+        print()
+        die(
+            f"{live[0].name} looks like a live session.\n"
+            "       Its context still holds the value and can write it back "
+            "after this pass.\n"
+            "       Exit that session and re-run, or pass --force to accept a "
+            "best-effort result."
+        )
+
+    if args.dry_run:
+        print()
+        print(_c("1;33", "dry run") + " — nothing was written")
+        return 1
+
+    print()
+    print(
+        _c("1;31", "This rewrites those files in place and cannot be undone.")
+        + " There is no backup:"
+    )
+    print("  a store holding every secret you ever redacted would be worse than "
+          "the leak.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("refusing to redact without confirmation; pass --yes")
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("aborted; nothing was written")
+            return 1
+
+    edits = [redact_file(f, reps, dry_run=False) for f in files]
+    total = sum(e.count for e in edits)
+    changed = [e for e in edits if e.count]
+    print()
+    print(f"replaced {total} occurrence(s) across {len(changed)} file(s)")
+    write_journal(edits)
+
+    print("verifying...")
+    leftovers = verify_removed(reps, config_dirs(args),
+                               [Path(x).expanduser() for x in (args.path or [])])
+    if leftovers:
+        print()
+        print(_c("1;31", "still present after redaction:"))
+        for value, paths in leftovers.items():
+            key = next((r.key for r in reps if r.value == value), "value")
+            print(f"  {key}: {len(paths)} file(s)")
+            for pth in paths[:5]:
+                print(f"    {pth}")
+        return 1
+
+    print(_c("1;32", "verified") + " — no scanned file still contains those values")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1768,7 +2077,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         c.files = len(res.locations.get(c.value, []))
         c.classify(args.min_length)
 
-    # 4. report
+    # 4. redact, if asked
+    if args.redact:
+        return _do_redact(args, cands, res, targets)
+
+    # 5. report
     if args.json:
         print(
             json.dumps(

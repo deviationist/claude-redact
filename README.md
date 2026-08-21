@@ -18,8 +18,8 @@ directories are normal.
 
 ## Status
 
-`0.1.0` — **scanning only.** Nothing is ever modified. Redaction and a
-prevention hook are planned; see [Roadmap](#roadmap).
+`0.2.0` — scanning and redaction. A prevention hook is still planned; see
+[Roadmap](#roadmap).
 
 ## Install
 
@@ -97,6 +97,46 @@ output like `docker compose config`, `docker inspect`, or something pasted into
 a prompt once. Deliberately shape-based rather than entropy-based: transcripts
 are full of git SHAs, UUIDs, base64 and minified code, and an entropy threshold
 buries real findings in noise.
+
+## Removing what you find
+
+```bash
+claude-redact --redact --dry-run    # show exactly what would change
+claude-redact --redact              # plan, confirm, rewrite, verify
+```
+
+Each confirmed value is replaced with `[REDACTED:KEY_NAME]`, so the transcript
+stays readable and you can see later what was removed.
+
+**This is destructive and there is no undo.** That is deliberate: an undo store
+would have to hold every secret you ever redacted, in one predictable path —
+strictly worse than the leak being cleaned, which is one string buried in a
+large tree. The dry run and the confirmation prompt are the safety net instead.
+Your config file is untouched, so it remains the source of truth.
+
+Guarantees, each covered by tests:
+
+- **Only `redact` verdicts** are touched. `--include-review` widens it;
+  `--value` bypasses the classifier, since you have already said what it is.
+- **Rewritten in place**, never write-and-rename. Claude Code holds the active
+  transcript open for append, and a rename leaves that descriptor writing into
+  an unlinked inode — silently losing the rest of the session.
+- **JSONL lines without a hit stay byte-identical.** Lines with one are edited
+  raw where possible, and only parsed and re-serialised when the value contains
+  characters JSON escapes and a raw search cannot find it.
+- **Undecodable bytes round-trip** unchanged.
+- **A live session is refused** unless `--force`. Its context still holds the
+  value and can write it back, so redacting it is best-effort at best — exit
+  the session first.
+- **Non-interactive runs refuse** without `--yes`.
+- **A verify pass re-scans everything afterwards** — the whole of each config
+  dir, not just the files that were rewritten — and reports anything still
+  present. Coverage becomes a result you can read rather than a design
+  assumption.
+
+A journal at `$XDG_STATE_HOME/claude-redact/journal.jsonl` (mode `0600`) records
+file, key names and counts. **No values, and no hashes** — a SHA-256 of a weak
+password is brute-forceable, which would reintroduce the risk in miniature.
 
 ## Scope
 
@@ -301,10 +341,7 @@ development and are labelled as such.
 ## Roadmap
 
 1. **Scanning** — done.
-2. **Redaction** — replace a confirmed value with `[REDACTED:KEY_NAME]`,
-   JSON-aware, in-place so an open append handle is not broken, with a
-   values-free journal. Destructive with no undo by design: an undo store
-   holding every secret you ever redacted would be worse than the leak.
+2. **Redaction** — done.
 3. **Prevention** — possibly a `--hook` mode reusing the same parsers.
 
 ## License

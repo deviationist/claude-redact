@@ -1432,5 +1432,394 @@ class TestRobustness(TempTree):
         self.assertIn("further finding(s) not expanded", out.getvalue())
 
 
+# ---------------------------------------------------------------------------
+# redaction (destructive path - the most heavily covered part of the suite)
+# ---------------------------------------------------------------------------
+
+SECRET = "Kx7vQm2ZpLr9WtBn"
+
+
+class TestRedactMechanics(TempTree):
+    def reps(self, value=SECRET, key="MYSQL_PASSWORD"):
+        return [cr.Replacement(value=value, placeholder=f"[REDACTED:{key}]", key=key)]
+
+    def test_dry_run_writes_nothing(self):
+        p = self.write("t.txt", f"the value is {SECRET} ok")
+        before = p.read_bytes()
+        edit = cr.redact_file(p, self.reps(), dry_run=True)
+        self.assertEqual(edit.count, 1)
+        self.assertEqual(p.read_bytes(), before, "dry run modified the file")
+
+    def test_replaces_with_placeholder(self):
+        p = self.write("t.txt", f"the value is {SECRET} ok")
+        edit = cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(edit.count, 1)
+        text = p.read_text()
+        self.assertNotIn(SECRET, text)
+        self.assertIn("[REDACTED:MYSQL_PASSWORD]", text)
+
+    def test_all_occurrences_replaced(self):
+        p = self.write("t.txt", f"{SECRET} {SECRET}\n{SECRET}\n")
+        edit = cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(edit.count, 3)
+        self.assertNotIn(SECRET, p.read_text())
+
+    def test_inode_is_preserved(self):
+        """Rewrite in place, never rename: Claude Code holds the active
+        transcript open for append, and a rename orphans that descriptor."""
+        p = self.write("t.txt", f"x {SECRET} y")
+        before = p.stat().st_ino
+        cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(p.stat().st_ino, before, "file was replaced, not rewritten")
+
+    def test_file_mode_is_preserved(self):
+        p = self.write("t.txt", f"x {SECRET} y")
+        p.chmod(0o600)
+        cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
+    def test_file_is_truncated_not_padded(self):
+        """The placeholder may be shorter than the value; no trailing junk."""
+        long_secret = "Q" * 200
+        p = self.write("t.txt", f"a{long_secret}b")
+        cr.redact_file(p, [cr.Replacement(long_secret, "[R]", "K")], dry_run=False)
+        self.assertEqual(p.read_text(), "a[R]b")
+
+    def test_undecodable_bytes_round_trip(self):
+        p = self.root / "weird.txt"
+        p.write_bytes(b"\xff\xfe head " + SECRET.encode() + b" tail \x80\x81")
+        cr.redact_file(p, self.reps(), dry_run=False)
+        raw = p.read_bytes()
+        self.assertNotIn(SECRET.encode(), raw)
+        self.assertTrue(raw.startswith(b"\xff\xfe"), "leading bytes corrupted")
+        self.assertTrue(raw.endswith(b"\x80\x81"), "trailing bytes corrupted")
+
+    def test_absent_value_leaves_file_untouched(self):
+        p = self.write("t.txt", "nothing to see")
+        before = p.read_bytes()
+        edit = cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(edit.count, 0)
+        self.assertEqual(p.read_bytes(), before)
+
+    def test_unwritable_file_warns_and_reports_nothing_changed(self):
+        p = self.write("ro.txt", f"x {SECRET} y")
+        p.chmod(0o444)
+        self.addCleanup(lambda: p.chmod(0o644))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            edit = cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertEqual(edit.count, 0, "must not claim a write that failed")
+        self.assertIn("cannot write", err.getvalue())
+
+
+class TestRedactJsonl(TempTree):
+    def reps(self, value=SECRET, key="K"):
+        return [cr.Replacement(value=value, placeholder=f"[REDACTED:{key}]", key=key)]
+
+    def test_untouched_lines_are_byte_identical(self):
+        keep = json.dumps({"type": "user", "message": "unrelated", "n": 1.0})
+        hit = json.dumps({"type": "user", "message": f"saw {SECRET}"})
+        p = self.write("t.jsonl", keep + "\n" + hit + "\n")
+        cr.redact_file(p, self.reps(), dry_run=False)
+        lines = p.read_text().splitlines()
+        self.assertEqual(lines[0], keep, "an untouched line was rewritten")
+        self.assertNotIn(SECRET, lines[1])
+
+    def test_result_is_still_valid_jsonl(self):
+        rows = [
+            json.dumps({"a": f"x{SECRET}y", "b": [1, 2, {"c": SECRET}]}),
+            json.dumps({"d": "clean"}),
+        ]
+        p = self.write("t.jsonl", "\n".join(rows) + "\n")
+        cr.redact_file(p, self.reps(), dry_run=False)
+        for line in p.read_text().splitlines():
+            json.loads(line)
+        self.assertNotIn(SECRET, p.read_text())
+
+    def test_escaped_value_is_redacted(self):
+        """A value containing a quote is escaped on disk; the raw path cannot
+        find it, so those lines must be parsed."""
+        tricky = 'pa"ss\\word'
+        line = json.dumps({"m": f"cat .env -> {tricky}"})
+        p = self.write("t.jsonl", line + "\n")
+        edit = cr.redact_file(
+            p, [cr.Replacement(tricky, "[REDACTED:P]", "P")], dry_run=False)
+        self.assertEqual(edit.count, 1)
+        doc = json.loads(p.read_text().strip())
+        self.assertIn("[REDACTED:P]", doc["m"])
+        self.assertNotIn(tricky, p.read_text())
+
+    def test_nested_structures_are_reached(self):
+        tricky = 'a"b'
+        doc = {"x": {"y": [{"z": f"--{tricky}--"}]}}
+        p = self.write("t.jsonl", json.dumps(doc) + "\n")
+        cr.redact_file(p, [cr.Replacement(tricky, "[R]", "K")], dry_run=False)
+        got = json.loads(p.read_text().strip())
+        self.assertEqual(got["x"]["y"][0]["z"], "--[R]--")
+
+    def test_malformed_line_still_redacted(self):
+        p = self.write("t.jsonl", f"this is not json but has {SECRET}\n")
+        cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertNotIn(SECRET, p.read_text())
+
+    def test_trailing_newline_preserved(self):
+        p = self.write("t.jsonl", json.dumps({"m": SECRET}) + "\n")
+        cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertTrue(p.read_text().endswith("\n"))
+
+    def test_no_trailing_newline_not_invented(self):
+        p = self.write("t.jsonl", json.dumps({"m": SECRET}))
+        cr.redact_file(p, self.reps(), dry_run=False)
+        self.assertFalse(p.read_text().endswith("\n"))
+
+
+class TestJournal(TempTree):
+    def setUp(self):
+        super().setUp()
+        self._orig_state, self._orig_journal = cr.STATE_DIR, cr.JOURNAL
+        cr.STATE_DIR = self.root / "state"
+        cr.JOURNAL = cr.STATE_DIR / "journal.jsonl"
+        self.addCleanup(
+            lambda: (setattr(cr, "STATE_DIR", self._orig_state),
+                     setattr(cr, "JOURNAL", self._orig_journal)))
+
+    def test_journal_records_what_was_touched(self):
+        edit = cr.FileEdit(path=Path("/x/y.jsonl"), count=3,
+                           per_key={"MYSQL_PASSWORD": 3})
+        cr.write_journal([edit])
+        row = json.loads(cr.JOURNAL.read_text().strip())
+        self.assertEqual(row["count"], 3)
+        self.assertEqual(row["keys"], {"MYSQL_PASSWORD": 3})
+
+    def test_journal_never_contains_the_value(self):
+        edit = cr.FileEdit(path=Path("/x/y.jsonl"), count=1,
+                           per_key={"MYSQL_PASSWORD": 1})
+        cr.write_journal([edit])
+        self.assertNotIn(SECRET, cr.JOURNAL.read_text())
+
+    def test_journal_is_owner_only(self):
+        cr.write_journal([cr.FileEdit(path=Path("/x"), count=1, per_key={"K": 1})])
+        self.assertEqual(cr.JOURNAL.stat().st_mode & 0o777, 0o600)
+
+    def test_nothing_written_when_no_edits(self):
+        cr.write_journal([cr.FileEdit(path=Path("/x"), count=0)])
+        self.assertFalse(cr.JOURNAL.exists())
+
+
+class TestRedactCLI(TempTree):
+    def setUp(self):
+        super().setUp()
+        self.claude_home = self.root / "claude"
+        self.proj = self.claude_home / "projects" / "-tmp-proj"
+        self.proj.mkdir(parents=True)
+        self._orig = cr.CLAUDE_HOME
+        cr.CLAUDE_HOME = self.claude_home
+        self.addCleanup(lambda: setattr(cr, "CLAUDE_HOME", self._orig))
+        self._os, self._oj = cr.STATE_DIR, cr.JOURNAL
+        cr.STATE_DIR = self.root / "state"
+        cr.JOURNAL = cr.STATE_DIR / "journal.jsonl"
+        self.addCleanup(lambda: (setattr(cr, "STATE_DIR", self._os),
+                                 setattr(cr, "JOURNAL", self._oj)))
+
+    def transcript(self, content, name="aaaa-bbbb.jsonl", age=3600):
+        import os, time
+        p = self.proj / name
+        p.write_text(json.dumps({"type": "user", "message": content}) + "\n")
+        old = time.time() - age
+        os.utime(p, (old, old))
+        return p
+
+    def envfile(self, body=f"MYSQL_PASSWORD={SECRET}\n"):
+        return self.write("proj/.env", body)
+
+    class _Tty(io.StringIO):
+        """stdin that claims to be a terminal, so the prompt path is reachable.
+
+        A plain StringIO reports isatty() False and correctly trips the
+        non-interactive refusal instead - which is a different code path.
+        """
+
+        def isatty(self):
+            return True
+
+    def run_cli(self, argv, stdin=None):
+        out, err = io.StringIO(), io.StringIO()
+        orig = sys.stdin
+        if stdin is not None:
+            sys.stdin = self._Tty(stdin)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = cr.main(argv)
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            sys.stdin = orig
+        return code, out.getvalue(), err.getvalue()
+
+    def test_dry_run_changes_nothing_on_disk(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        before = t.read_bytes()
+        env = self.envfile()
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--dry-run"])
+        self.assertEqual(code, 1)
+        self.assertIn("dry run", out)
+        self.assertIn("nothing was written", out)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_dry_run_names_the_files_and_the_placeholder(self):
+        self.transcript(f"leaked {SECRET} here")
+        env = self.envfile()
+        _, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--dry-run"])
+        self.assertIn("[REDACTED:MYSQL_PASSWORD]", out)
+        self.assertIn("aaaa-bbbb.jsonl", out)
+        self.assertNotIn(SECRET, out, "the plan must not print the value")
+
+    def test_redaction_removes_the_value_and_verifies(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        env = self.envfile()
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertIn("verified", out)
+        self.assertNotIn(SECRET, t.read_text())
+        self.assertIn("[REDACTED:MYSQL_PASSWORD]", t.read_text())
+
+    def test_declining_the_prompt_writes_nothing(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        before = t.read_bytes()
+        env = self.envfile()
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact"], stdin="n\n")
+        self.assertEqual(code, 1)
+        self.assertIn("aborted", out)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_accepting_the_prompt_redacts(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        env = self.envfile()
+        code, _, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact"], stdin="y\n")
+        self.assertEqual(code, 0)
+        self.assertNotIn(SECRET, t.read_text())
+
+    def test_empty_answer_is_treated_as_no(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        before = t.read_bytes()
+        env = self.envfile()
+        code, _, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact"], stdin="\n")
+        self.assertEqual(code, 1)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_non_interactive_without_yes_refuses(self):
+        t = self.transcript(f"leaked {SECRET} here")
+        before = t.read_bytes()
+        env = self.envfile()
+        code, _, err = self.run_cli(["--from-file", str(env), "--all", "--redact"])
+        self.assertEqual(code, 2)
+        self.assertIn("--yes", err)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_live_session_is_refused_without_force(self):
+        t = self.transcript(f"leaked {SECRET} here", age=0)
+        before = t.read_bytes()
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 2)
+        self.assertIn("live session", err)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_force_redacts_a_live_session(self):
+        t = self.transcript(f"leaked {SECRET} here", age=0)
+        env = self.envfile()
+        code, _, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes", "--force"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(SECRET, t.read_text())
+
+    def test_benign_values_are_not_redacted(self):
+        t = self.transcript("PUID=1000 and TZ=Europe/Oslo")
+        before = t.read_bytes()
+        env = self.envfile("PUID=1000\nTZ=Europe/Oslo\n")
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to redact", out)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_review_verdicts_need_opt_in(self):
+        value = "aZ4tYuIoPaSdFgHjK"
+        t = self.transcript(f"value {value} seen")
+        env = self.envfile(f"UNKNOWN_THING={value}\n")
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--dry-run"])
+        self.assertIn("nothing to redact", out)
+        _, out2, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--dry-run",
+             "--include-review"])
+        self.assertIn("UNKNOWN_THING", out2)
+        self.assertEqual(t.read_text().count(value), 1, "dry run wrote")
+
+    def test_explicit_value_bypasses_the_classifier(self):
+        """--value means the user has already said what it is."""
+        low = "aaaaaaaaaa"
+        t = self.transcript(f"here is {low} ok")
+        code, _, _ = self.run_cli(["--value", low, "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(low, t.read_text())
+
+    def test_journal_written_after_redaction(self):
+        self.transcript(f"leaked {SECRET} here")
+        env = self.envfile()
+        self.run_cli(["--from-file", str(env), "--all", "--redact", "--yes"])
+        rows = [json.loads(l) for l in cr.JOURNAL.read_text().splitlines()]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["keys"], {"MYSQL_PASSWORD": 1})
+        self.assertNotIn(SECRET, cr.JOURNAL.read_text())
+
+    def test_verify_reports_leftovers(self):
+        """A copy outside the redacted scope must be reported, not ignored."""
+        self.transcript(f"leaked {SECRET} here")
+        leftover = self.claude_home / "paste-cache" / "x.txt"
+        leftover.parent.mkdir(parents=True)
+        leftover.write_text(f"also {SECRET}\n")
+        leftover.chmod(0o444)
+        self.addCleanup(lambda: leftover.chmod(0o644))
+        env = self.envfile()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out, _ = self.run_cli(
+                ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 1)
+        self.assertIn("still present after redaction", out)
+
+    def test_multiple_files_all_redacted(self):
+        a = self.transcript(f"one {SECRET}", name="aaaa-bbbb.jsonl")
+        b = self.transcript(f"two {SECRET}", name="cccc-dddd.jsonl")
+        env = self.envfile()
+        code, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(SECRET, a.read_text())
+        self.assertNotIn(SECRET, b.read_text())
+        self.assertIn("2 file(s)", out)
+
+    def test_file_history_snapshot_is_redacted_too(self):
+        self.transcript(f"leaked {SECRET} here")
+        fh = self.claude_home / "file-history" / "aaaa-bbbb"
+        fh.mkdir(parents=True)
+        snap = fh / "abc@v1"
+        snap.write_text(f"MYSQL_PASSWORD={SECRET}\n")
+        env = self.envfile()
+        code, _, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(SECRET, snap.read_text())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
