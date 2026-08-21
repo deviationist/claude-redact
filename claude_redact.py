@@ -487,6 +487,25 @@ def session_of(transcript: Path) -> str:
     return transcript.stem
 
 
+def session_targets(transcript: Path) -> list[Path]:
+    """Every file belonging to one session.
+
+    Beyond the .jsonl itself there are two sibling locations, both confirmed on
+    a live host and both easy to miss:
+
+      projects/<slug>/<uuid>/subagents/agent-*.jsonl   subagent transcripts
+      projects/<slug>/<uuid>/tool-results/*            raw tool output on disk
+
+    The second is where a large `cat .env` result ends up, so omitting it would
+    leave the credential behind while reporting the session clean.
+    """
+    uuid = session_of(transcript)
+    out = [transcript]
+    out.extend(iter_files(transcript.parent / uuid))
+    out.extend(iter_files(CLAUDE_HOME / "file-history" / uuid))
+    return out
+
+
 def is_active(path: Path, window: float = 120.0) -> bool:
     """Heuristic: a transcript touched moments ago is probably a live session.
 
@@ -534,8 +553,8 @@ def resolve_targets(args: argparse.Namespace) -> list[Path]:
         matches = list((CLAUDE_HOME / "projects").glob(f"*/{args.session}.jsonl"))
         if not matches:
             die(f"no transcript found for session {args.session}")
-        targets.extend(matches)
-        targets.extend(iter_files(CLAUDE_HOME / "file-history" / args.session))
+        for m in matches:
+            targets.extend(session_targets(m))
     else:
         proj = CLAUDE_HOME / "projects" / encode_cwd(Path.cwd().resolve())
         if not proj.is_dir():
@@ -546,8 +565,7 @@ def resolve_targets(args: argparse.Namespace) -> list[Path]:
         newest = _newest(list(proj.glob("*.jsonl")))
         if newest is None:
             die(f"no .jsonl transcripts in {proj}")
-        targets.append(newest)
-        targets.extend(iter_files(CLAUDE_HOME / "file-history" / session_of(newest)))
+        targets.extend(session_targets(newest))
 
     for extra in args.path or []:
         p = Path(extra).expanduser()

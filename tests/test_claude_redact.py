@@ -496,6 +496,27 @@ class TestCLI(TempTree):
                 code = e.code
         return code, out.getvalue(), err.getvalue()
 
+    def test_session_scope_includes_subagents_and_tool_results(self):
+        """Regression: default scope missed projects/<slug>/<uuid>/tool-results/,
+        which is where large raw tool output (e.g. a cat of .env) is stored."""
+        proj = self.claude_home / "projects" / "-tmp-proj"
+        t = proj / "aaaa-bbbb.jsonl"
+        t.write_text(json.dumps({"type": "user", "message": "hi"}) + "\n")
+        (proj / "aaaa-bbbb" / "subagents").mkdir(parents=True)
+        (proj / "aaaa-bbbb" / "subagents" / "agent-1.jsonl").write_text(
+            json.dumps({"message": "sub saw Kx7vQm2ZpLr9WtBn"}) + "\n")
+        (proj / "aaaa-bbbb" / "tool-results").mkdir(parents=True)
+        (proj / "aaaa-bbbb" / "tool-results" / "r1.txt").write_text("Zx9KpQm2VnLr7Wtc\n")
+
+        found = cr.session_targets(t)
+        names = {p.name for p in found}
+        self.assertIn("agent-1.jsonl", names)
+        self.assertIn("r1.txt", names)
+
+        res = cr.scan(found, ["Kx7vQm2ZpLr9WtBn", "Zx9KpQm2VnLr7Wtc"])
+        self.assertEqual(res.counts["Kx7vQm2ZpLr9WtBn"], 1)
+        self.assertEqual(res.counts["Zx9KpQm2VnLr7Wtc"], 1)
+
     def test_exit_zero_when_clean(self):
         self.transcript("nothing sensitive here")
         env = self.write("proj/.env", "MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")

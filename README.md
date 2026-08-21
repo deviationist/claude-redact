@@ -93,10 +93,23 @@ buries real findings in noise.
 
 | Flag | Scans |
 |---|---|
-| *(default)* | The newest transcript for the current directory, plus that session's `file-history/` |
-| `--session UUID` | One specific session and its `file-history/` |
+| *(default)* | The newest transcript for the current directory, plus everything else belonging to that session (see below) |
+| `--session UUID` | One specific session, same coverage |
 | `--all` | Everything under `~/.claude`: `projects/`, `file-history/`, `history.jsonl`, `paste-cache/`, `shell-snapshots/`, `backups/`, `debug/`, `todos/` |
 | `--path P` | Any extra file or directory (repeatable) — combine with any of the above |
+
+A session is more than its `.jsonl`. Three locations are searched together:
+
+```
+projects/<slug>/<uuid>.jsonl                  the transcript
+projects/<slug>/<uuid>/subagents/*.jsonl      subagent transcripts
+projects/<slug>/<uuid>/tool-results/*         raw tool output written to disk
+file-history/<uuid>/*                         pre-edit copies of files that were edited
+```
+
+`tool-results/` matters most: large tool output is stored there rather than
+inline, so a sizeable `cat .env` can land in a file the transcript only points
+at. Scanning the `.jsonl` alone would report the session clean.
 
 `--all` is the honest choice when you do not know which session leaked.
 
