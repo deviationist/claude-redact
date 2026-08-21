@@ -147,6 +147,36 @@ Tune with `--min-length N` (default 8). `--show-prefix N` reveals the first N
 characters of each value; it defaults to 0 because anything printed lands in the
 transcript you are currently in.
 
+## Tuning which keys count as credentials
+
+The built-in credential key names (`pass`, `password`, `pwd`, `secret`, `token`,
+`api_key`, `private_key`, `credential`, `auth`, `salt`, `dsn`, …) can be
+extended for your own conventions — never replaced, since narrowing detection is
+the one direction that loses credentials.
+
+Per run:
+
+```bash
+claude-redact --key-pattern 'vault|kms|licence' --benign-pattern 'mount|replica'
+```
+
+Or persistently, in `~/.config/claude-redact/config.ini` (or `.claude-redact.ini`
+in the directory you run from):
+
+```ini
+[keys]
+# regex alternatives added to the built-in credential key names
+secret = vault|kms|licence|handle
+# added to the built-in benign key names
+benign = mount|replica|shard
+
+[values]
+# never treated as credentials, comma or newline separated
+stoplist = mycorp, internal.example
+```
+
+`--no-config` ignores both files. `--stop-value` adds a single value for one run.
+
 ## Ignoring files
 
 `*.example`, `*.sample`, `*.template`, `*.dist` and `*.default` are skipped by

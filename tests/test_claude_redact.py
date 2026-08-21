@@ -264,6 +264,29 @@ class TestStructuredExtraction(TempTree):
         p = self.write("msmtprc", "account default\nhost smtp.example.com\npassword Kx7vQm2ZpLr9WtBn\n")
         self.assertIn("Kx7vQm2ZpLr9WtBn", self.values(p))
 
+    def test_compose_list_form_environment_splits_into_pairs(self):
+        """Regression: `environment: [- PUID=1000]` yielded the whole string as
+        one opaque value, losing the key name and scoring as a mystery token."""
+        p = self.write("docker-compose.yml", "\n".join([
+            "services:", "  app:", "    environment:",
+            "      - PUID=1000", "      - TZ=Europe/Oslo",
+            "      - APP_SECRET=Kx7vQm2ZpLr9WtBn",
+        ]))
+        cands = {c.key: c for c in cr.extract_candidates(p, 8)}
+        self.assertIn("APP_SECRET", cands)
+        self.assertEqual(cands["APP_SECRET"].value, "Kx7vQm2ZpLr9WtBn")
+        self.assertNotIn("PUID=1000", {c.value for c in cands.values()})
+
+    def test_build_flags_are_benign(self):
+        for key, value in (
+            ("target.x86_64-unknown-linux-gnu.rustflags[1]", "-Clink-arg=-fuse-ld=lld"),
+            ("build.rustflags", "target-feature=+crt-static"),
+        ):
+            with self.subTest(key=key):
+                c = cr.Candidate(key=key, value=value, hits=6)
+                c.classify(8)
+                self.assertEqual(c.verdict, "skip")
+
     def test_yaml_without_pyyaml_via_line_scanner(self):
         """PyYAML is absent on stock macOS; compose files must still work."""
         p = self.write("docker-compose.yml", "\n".join([

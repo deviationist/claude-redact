@@ -57,21 +57,20 @@ MAX_SCAN_BYTES = 64 * 1024 * 1024  # per-file ceiling for the verify sweep
 # classification
 # ---------------------------------------------------------------------------
 
-# Key names that strongly imply the value is a credential.
-SECRET_KEY_RE = re.compile(
-    r"(?:^|[._\-/])(?:"
+# Key names that strongly imply the value is a credential. The alternation is
+# kept separate from the surrounding anchors so user patterns can extend it -
+# see configure() and load_user_config().
+_SECRET_KEY_BASE = (
     r"pass(?:wd|word)?|pwd|secret|token|api_?key|apikey|access_?key|"
     r"private_?key|privkey|credential|auth|bearer|session_?key|"
     r"encryption_?key|signing_?key|salt|seed|nonce|otp|totp|"
     r"client_?secret|refresh_?token|sas|dsn|conn(?:ection)?_?str"
-    r")(?:$|[._\-/])",
-    re.IGNORECASE,
 )
 
-# Key names that almost never hold a credential. Checked after SECRET_KEY_RE,
-# so API_KEY_TIMEOUT still classifies as secret-ish; that is the safe direction.
-BENIGN_KEY_RE = re.compile(
-    r"(?:^|[._\-/])(?:"
+# Key names that almost never hold a credential. Checked after the secret
+# pattern, so API_KEY_TIMEOUT still classifies as secret-ish; that is the safe
+# direction.
+_BENIGN_KEY_BASE = (
     r"port|host|hostname|addr|address|url|uri|path|dir|file|name|user(?:name)?|"
     r"tz|timezone|lang|locale|log_?level|debug|env|environment|version|"
     r"puid|pgid|uid|gid|umask|timeout|retries|interval|enabled?|disabled?|"
@@ -79,10 +78,22 @@ BENIGN_KEY_RE = re.compile(
     # compose/k8s structural keys - the leaf names a knob, never a secret
     r"image|command|entrypoint|container_name|volumes|networks|ports|"
     r"depends_on|restart|labels|cap_add|cap_drop|devices|healthcheck|"
-    r"working_dir|profiles|replicas|platform|pull_policy|shm_size"
-    r")(?:$|[._\-/])",
-    re.IGNORECASE,
+    r"working_dir|profiles|replicas|platform|pull_policy|shm_size|"
+    # build/toolchain knobs: rustflags, ldflags, compiler args, linker targets
+    r"rustflags|cflags|cxxflags|ldflags|cppflags|flags|args|argv|opts|options|"
+    r"linker|rpath|target|features|toolchain|edition|runner|incremental"
 )
+
+
+def _key_regex(base: str, extra: Sequence[str] = ()) -> "re.Pattern[str]":
+    alternation = "|".join([base, *[e for e in extra if e]])
+    return re.compile(
+        r"(?:^|[._\-/])(?:" + alternation + r")(?:$|[._\-/])", re.IGNORECASE
+    )
+
+
+SECRET_KEY_RE = _key_regex(_SECRET_KEY_BASE)
+BENIGN_KEY_RE = _key_regex(_BENIGN_KEY_BASE)
 
 # Values that are common words or enum-ish, never worth redacting on their own.
 STOPLIST = {
@@ -106,6 +117,74 @@ VOLUME_SPEC_RE = re.compile(r"^[\w./\-${}]+:/[\w./\-]+(?::(?:ro|rw|z|Z|r?slave|r
 # Linux capability lists (cap_add), e.g. NET_ADMIN or SYS_ADMIN,NET_RAW.
 CAP_LIST_RE = re.compile(r"^[A-Z][A-Z_]{2,}(?:,[A-Z][A-Z_]{2,})*$")
 SEMVER_RE = re.compile(r"^v?\d+\.\d+(?:\.\d+)?(?:[.\-+][\w.\-]+)?$")
+
+
+CONFIG_FILENAME = "config.ini"
+LOCAL_CONFIG = ".claude-redact.ini"
+
+
+def config_paths() -> list[Path]:
+    """User config, then a per-project override in the working directory."""
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return [xdg / "claude-redact" / CONFIG_FILENAME, Path.cwd() / LOCAL_CONFIG]
+
+
+def load_user_config() -> dict[str, list[str]]:
+    """Read extra key patterns and stoplist values from config files.
+
+        [keys]
+        # regex alternatives, added to the built-in credential key names
+        secret = pwd|vault|kms|licence
+        # added to the built-in benign key names
+        benign = mount|replica
+
+        [values]
+        # never treated as credentials, one per line or comma separated
+        stoplist = mycorp, internal.example
+    """
+    import configparser
+
+    out: dict[str, list[str]] = {"secret": [], "benign": [], "stoplist": []}
+    for path in config_paths():
+        if not path.is_file():
+            continue
+        cp = configparser.ConfigParser(interpolation=None)
+        try:
+            cp.read_string(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            warn(f"ignoring malformed config {path}: {exc}")
+            continue
+        if cp.has_option("keys", "secret"):
+            out["secret"].append(cp.get("keys", "secret").strip())
+        if cp.has_option("keys", "benign"):
+            out["benign"].append(cp.get("keys", "benign").strip())
+        if cp.has_option("values", "stoplist"):
+            raw = cp.get("values", "stoplist")
+            out["stoplist"].extend(
+                v.strip().lower()
+                for v in re.split(r"[,\n]", raw)
+                if v.strip()
+            )
+    return out
+
+
+def configure(
+    secret_patterns: Sequence[str] = (),
+    benign_patterns: Sequence[str] = (),
+    stoplist_values: Sequence[str] = (),
+) -> None:
+    """Extend the built-in key patterns and stoplist. Never replaces them:
+    narrowing detection is the one direction that loses credentials."""
+    global SECRET_KEY_RE, BENIGN_KEY_RE, STOPLIST
+    for pat in list(secret_patterns) + list(benign_patterns):
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            die(f"invalid key pattern {pat!r}: {exc}")
+    SECRET_KEY_RE = _key_regex(_SECRET_KEY_BASE, secret_patterns)
+    BENIGN_KEY_RE = _key_regex(_BENIGN_KEY_BASE, benign_patterns)
+    if stoplist_values:
+        STOPLIST = STOPLIST | {v.lower() for v in stoplist_values}
 
 
 def entropy(value: str) -> float:
@@ -173,8 +252,12 @@ class Candidate:
         look like a credential because the path contains "auth". Only the leaf
         names the value.
         """
-        leaf = re.split(r"[.\[]", self.key)[-1] if self.key else ""
-        return leaf or self.key
+        if not self.key:
+            return ""
+        # Strip list indices first: rustflags[1] must yield "rustflags", not "1]".
+        stripped = re.sub(r"\[\d+\]$", "", self.key)
+        leaf = stripped.rsplit(".", 1)[-1]
+        return leaf or stripped
 
     def classify(self, min_length: int) -> None:
         v = self.value
@@ -218,11 +301,14 @@ class Candidate:
             else:
                 self.verdict, self.reason = "redact", "credential key name"
             return
-        if ent >= 3.2 and len(v) >= 16 and charset_classes(v) >= 2 and self.hits <= 10:
-            self.verdict, self.reason = "redact", f"entropy {ent:.1f}"
-            return
+        # Benign keys are checked before the entropy rule: a linker flag or a
+        # volume spec is high-entropy by nature, and an explicit key name is the
+        # more reliable signal about what the value actually is.
         if benign_key and ent < 4.5:
             self.verdict, self.reason = "skip", "benign key name"
+            return
+        if ent >= 3.2 and len(v) >= 16 and charset_classes(v) >= 2 and self.hits <= 10:
+            self.verdict, self.reason = "redact", f"entropy {ent:.1f}"
             return
 
         self.verdict, self.reason = "review", f"entropy {ent:.1f}, {self.hits} hits"
@@ -257,6 +343,10 @@ SPACE_ASSIGN_RE = re.compile(
     r"^\s*(password|passwordeval|user|login|account|machine|secret|token)\s+(\S.*?)\s*$",
     re.IGNORECASE,
 )
+# `environment: [- PUID=1000]` in compose gives the whole "PUID=1000" string as
+# one value, losing the key name and making it look like a random token. Uppercase
+# is required so ordinary values containing '=' (base64 padding) are left alone.
+ENV_ASSIGN_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)=(.*)$", re.DOTALL)
 QUOTED_RE = re.compile(r"""(['"])((?:(?!\1)[^\\]|\\.){6,})\1""")
 URL_CRED_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://([^/\s:@]+):([^/\s@]+)@")
 BASIC_AUTH_RE = re.compile(r"\bBasic\s+([A-Za-z0-9+/=]{8,})", re.IGNORECASE)
@@ -432,6 +522,14 @@ def extract_candidates(path: Path, min_length: int) -> list[Candidate]:
     pairs = _structural_pairs(path, text)
     pairs += _line_pairs(text)
     pairs += _quoted_strings(text)
+
+    # Split list-form env assignments into real key/value pairs. Substituted
+    # rather than added: redacting the whole "PUID=1000" string would be wrong.
+    split_pairs: list[tuple[str, str]] = []
+    for key, value in pairs:
+        m = ENV_ASSIGN_RE.match(value.strip())
+        split_pairs.append((m.group(1), m.group(2)) if m else (key, value))
+    pairs = split_pairs
 
     for key, value in list(pairs):
         pairs.extend(_derive_embedded(key, value))
@@ -1254,6 +1352,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="additional file or directory to include (repeatable)",
     )
 
+    tune = p.add_argument_group("tuning")
+    tune.add_argument(
+        "--key-pattern",
+        action="append",
+        metavar="REGEX",
+        help="extra key names to treat as credentials, e.g. 'vault|kms|licence'. "
+        "Added to the built-ins (pass/password/token/secret/api_key/...), never "
+        "replacing them. Repeatable.",
+    )
+    tune.add_argument(
+        "--benign-pattern",
+        action="append",
+        metavar="REGEX",
+        help="extra key names to treat as never-credentials. Repeatable.",
+    )
+    tune.add_argument(
+        "--stop-value",
+        action="append",
+        metavar="VALUE",
+        help="a value never to treat as a credential. Repeatable.",
+    )
+    tune.add_argument(
+        "--no-config",
+        action="store_true",
+        help=f"ignore ~/.config/claude-redact/{CONFIG_FILENAME} and ./{LOCAL_CONFIG}",
+    )
+
     out = p.add_argument_group("output")
     out.add_argument(
         "--min-length",
@@ -1282,6 +1407,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    cfg = {"secret": [], "benign": [], "stoplist": []}
+    if not args.no_config:
+        cfg = load_user_config()
+    configure(
+        secret_patterns=cfg["secret"] + (args.key_pattern or []),
+        benign_patterns=cfg["benign"] + (args.benign_pattern or []),
+        stoplist_values=cfg["stoplist"] + (args.stop_value or []),
+    )
 
     if not any((args.from_file, args.from_dir, args.value, args.discover)):
         # The overwhelmingly common intent is "audit this project's configs".
