@@ -789,6 +789,25 @@ def find_config_files(
 # UUIDs, base64 blobs and minified code, so an entropy threshold produces noise
 # that buries the real findings. These patterns are near-zero false positive.
 
+# These patterns must not match inside a longer word: "sk-" otherwise matches
+# "ta{sk-8...}" in a git branch name and "ma{sk-i}mage" in Tailwind classes,
+# which produced hundreds of false positives on a real transcript tree.
+#
+# The check is applied in Python after matching rather than as a (?<!...)
+# lookbehind in the pattern. A leading lookbehind defeats CPython's literal
+# prefix scan, costing ~5s per pattern over 554 MB - negligible alone, but 70s
+# across the fourteen patterns that need it. Checking one character at match
+# time is free, because matches are rare.
+BOUNDARY_KINDS = frozenset({
+    "aws_access_key", "github_pat", "github_fine_grained", "gitlab_pat",
+    "anthropic_key", "openai_key", "stripe_key", "slack_token", "sendgrid_key",
+    "google_api_key", "google_oauth", "npm_token", "digitalocean_pat", "jwt",
+})
+
+_WORD_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+
 DISCOVERY_PATTERNS: list[tuple[str, str]] = [
     ("aws_access_key",      r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
     ("github_pat",          r"gh[pousr]_[A-Za-z0-9]{36,}"),
@@ -804,19 +823,21 @@ DISCOVERY_PATTERNS: list[tuple[str, str]] = [
     ("google_oauth",        r"ya29\.[0-9A-Za-z_\-]{20,}"),
     ("npm_token",           r"npm_[A-Za-z0-9]{36}"),
     ("digitalocean_pat",    r"dop_v1_[a-f0-9]{64}"),
-    ("jwt",                 r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    # Upper bounds keep a greedy class from swallowing minified code: a real
+    # JWT or bearer token is not 676 characters long.
+    ("jwt",                 r"eyJ[A-Za-z0-9_\-]{10,1024}\.eyJ[A-Za-z0-9_\-]{10,1024}\.[A-Za-z0-9_\-]{10,512}"),
     ("private_key_block",   r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
     ("url_credentials",
      r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@\"']+:"
-     r"(?P<url_pw>[^/\s@\"']{4,})@[^\s\"']+"),
-    ("basic_auth_header",   r"[Aa]uthorization[\"']?\s*[:=]\s*[\"']?Basic\s+[A-Za-z0-9+/=]{12,}"),
-    ("bearer_header",       r"[Aa]uthorization[\"']?\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._\-]{20,}"),
+     r"(?P<url_pw>[^/\s@\"']{4,128})@[^\s\"']+"),
+    ("basic_auth_header",   r"[Aa]uthorization[\"']?\s*[:=]\s*[\"']?Basic\s+[A-Za-z0-9+/=]{12,512}"),
+    ("bearer_header",       r"[Aa]uthorization[\"']?\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._\-]{20,512}"),
     ("password_assignment",
      # No leading [A-Za-z0-9_.-]* here: it only spanned the key name, which is
      # never captured, and cost 13x in backtracking on every scanned position.
      r"(?i:password|passwd|secret|api[_\-]?key|token)(?![A-Za-z])"
      r"[A-Za-z0-9_.\-]*\s*[:=]\s*[\"']?"
-     r"(?P<pw_value>(?![0-9]+(?:[\s\"',;}]|$))[^\s\"',;}{]{8,})"),
+     r"(?P<pw_value>(?![0-9]+(?:[\s\"',;}]|$))[^\s\"',;}{]{8,256})"),
 ]
 
 # Measured: 20 separate passes beat one big alternation by 3.2x (0.096 vs
@@ -832,6 +853,35 @@ PLACEHOLDER_RE = re.compile(
     r"(?i)(?:redacted|example|changeme|your[_\-]?|placeholder|xxxx+|\*\*\*|"
     r"<[^>]+>|\{\{[^}]+\}\}|\$\{[^}]+\}|dummy|sample|test[_\-]?key|foo|bar)"
 )
+
+
+# Provider patterns (ghp_, AKIA, AIza...) are unambiguous - a match is a match.
+# These four infer from context instead, so they fire on ordinary source code:
+# `const token = ...`, `secret = opts?.token ?? x`. They get the noise filters.
+LOW_PRECISION_KINDS = frozenset({
+    "password_assignment", "bearer_header", "basic_auth_header", "url_credentials",
+})
+
+# Values shaped like code rather than credentials.
+CODE_SHAPE_RE = re.compile(r"(?:=>|\?\.|\$\{|[(){}\[\]]|::|`)")
+CODE_KEYWORDS = frozenset({
+    "string", "number", "boolean", "object", "null", "undefined", "void", "any",
+    "unknown", "never", "function", "return", "import", "export", "const", "let",
+})
+
+# A reference to a secret is not the secret: `api_key: process.env.OPENAI_KEY`
+# names where the value lives, and there is nothing there to redact.
+CODE_REF_RE = re.compile(
+    r"^(?:process\.env|import\.meta\.env|os\.environ|Deno\.env|ENV|env|"
+    r"self|this|opts|options|config|settings|secrets|vault)[.\[]",
+    re.IGNORECASE,
+)
+
+# A credential does not appear in dozens of unrelated files. This is the same
+# occurrence-count signal the known-value classifier uses, and it is measured
+# from the user's real tree rather than guessed from the value's shape.
+NOISE_MIN_HITS = 25
+NOISE_MIN_FILES = 3
 
 
 @dataclass
@@ -888,7 +938,14 @@ def discover(targets: Sequence[Path]) -> tuple[list[Finding], ScanResult]:
             continue
 
         for kind, rx in _DISCOVERY_COMPILED:
+            needs_boundary = kind in BOUNDARY_KINDS
             for m in rx.finditer(raw):
+                if (
+                    needs_boundary
+                    and m.start() > 0
+                    and raw[m.start() - 1] in _WORD_CHARS
+                ):
+                    continue
                 secret = None
                 if kind == "password_assignment":
                     text = m.group("pw_value")
@@ -906,6 +963,23 @@ def discover(targets: Sequence[Path]) -> tuple[list[Finding], ScanResult]:
     # value (sk-ant-... matches anthropic_key AND openai_key). Keep whichever
     # appears first in DISCOVERY_PATTERNS - that table is ordered most-specific
     # first for exactly this reason.
+    def is_noise(f: "Finding") -> bool:
+        if f.kind not in LOW_PRECISION_KINDS:
+            return False
+        if f.hits > NOISE_MIN_HITS and len(f.files) > NOISE_MIN_FILES:
+            return True
+        v = f.sample
+        return bool(
+            v.lower() in CODE_KEYWORDS
+            or v.lower() in STOPLIST
+            or CODE_REF_RE.match(v)
+            or CODE_SHAPE_RE.search(v)
+            or looks_structural(v)
+        )
+
+    for key in [k for k, f in found.items() if is_noise(f)]:
+        del found[key]
+
     rank = {name: i for i, (name, _) in enumerate(DISCOVERY_PATTERNS)}
     by_value: dict[str, Finding] = {}
     for f in found.values():

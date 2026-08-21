@@ -294,6 +294,60 @@ class TestDiscoveryPatterns(TempTree):
         noise = '{"usage":{"input_tokens":15234,"cache_read_input_tokens":1553728,"output_tokens":812}}'
         self.assertNotIn("password_assignment", self.kinds_in(noise))
 
+    def test_no_match_inside_longer_words(self):
+        """Regression: 'sk-' matched mid-word, giving 275 false hits on one tree.
+
+        Real cases from a live transcript sweep: a git branch named "task-..."
+        and Tailwind's "mask-image" utility classes.
+        """
+        for noise in (
+            '{"gitBranch":"task-8f2a1c9d4b7e0a3f6c2d8b5"}',
+            '"mask-image-linear-pos":[{"mask-linear":[wx]}]',
+            'const unmask-identifier-value-here = 1',
+            '"branch":"refs/heads/task-2026-08-migrate-database"',
+        ):
+            with self.subTest(noise=noise):
+                self.assertEqual(self.kinds_in(noise), set(), f"{noise!r} must not match")
+
+    def test_real_key_still_matches_after_boundary_fix(self):
+        for sample in (
+            "sk-proj-abc123XYZ789defGHI456jklMNO012pqrSTU",
+            'API_KEY="sk-proj-abc123XYZ789defGHI456jklMNO012pqrSTU"',
+            "export OPENAI=sk-proj-abc123XYZ789defGHI456jklMNO012pqrSTU",
+        ):
+            with self.subTest(sample=sample):
+                self.assertIn("openai_key", self.kinds_in(sample))
+
+    def test_greedy_classes_are_bounded(self):
+        """Regression: bearer_header swallowed 676 chars of minified code."""
+        blob = "Authorization: Bearer " + ("a" * 4000)
+        findings, _ = cr.discover([self.write("big.txt", blob)])
+        for f in findings:
+            self.assertLessEqual(len(f.sample), 600, f"{f.kind} match unbounded")
+
+    def test_source_code_is_not_a_credential(self):
+        """Regression: `const token = ...` gave 417 hits across 96 files."""
+        for code in (
+            "const token = generateAccessToken(user)",
+            "secret = opts?.token ?? fallbackValue",
+            "export const uniq = (): string => nanoid()",
+            "def get_secret(self) -> Optional[str]:",
+            "api_key: process.env.OPENAI_API_KEY",
+        ):
+            with self.subTest(code=code):
+                self.assertNotIn("password_assignment", self.kinds_in(code))
+
+    def test_real_password_assignment_survives_noise_filter(self):
+        self.assertIn("password_assignment",
+                      self.kinds_in("MYSQL_ROOT_PASSWORD=Zx9KpQm2VnLr7WtBs4Hd"))
+
+    def test_provider_keys_exempt_from_noise_filter(self):
+        """A GitHub PAT is unambiguous - never drop it for being frequent."""
+        secret = "ghp_016Ap2mQxZ4vB8nK3rT7yU1wE5sD9fG2hJ4k"
+        paths = [self.write(f"f{i}.txt", "\n".join([secret] * 30)) for i in range(6)]
+        findings, _ = cr.discover(paths)
+        self.assertIn("github_pat", {f.kind for f in findings})
+
     def test_placeholders_suppressed(self):
         for line in ("API_KEY=your-api-key-here", "SECRET=<REDACTED>",
                      "PASSWORD=changeme", "TOKEN=${VAULT_TOKEN}",
