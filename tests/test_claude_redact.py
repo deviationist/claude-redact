@@ -117,6 +117,27 @@ class TestClassification(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.classify(key, value, hits=20).verdict, "skip")
 
+    def test_structural_subtrees_are_benign(self):
+        """`depends_on.postgres.condition = service_healthy` is configuration."""
+        c = cr.Candidate(key="services.api.depends_on.postgres.condition",
+                         value="service_healthy", hits=18)
+        c.classify(8)
+        self.assertEqual(c.verdict, "skip")
+
+    def test_environment_subtree_still_yields_secrets(self):
+        """environment holds arbitrary keys, so it must NOT mask its children."""
+        c = cr.Candidate(key="services.api.environment.R2_SECRET_KEY",
+                         value="Kx7vQm2ZpLr9WtBn", hits=3)
+        c.classify(8)
+        self.assertEqual(c.verdict, "redact")
+
+    def test_cloud_resource_names_are_benign(self):
+        for key in ("R2_BUCKET", "BACKUP_R2_BUCKET", "AWS_REGION", "GCP_PROJECT_ID"):
+            with self.subTest(key=key):
+                c = cr.Candidate(key=key, value="my-app-storage", hits=13)
+                c.classify(8)
+                self.assertEqual(c.verdict, "skip")
+
     def test_docker_volume_specs_are_structural(self):
         for v in ("ollama_data:/root/.ollama", "/srv/data:/data:ro",
                   "./config:/etc/app", "${PWD}/x:/x"):
@@ -134,6 +155,23 @@ class TestClassification(unittest.TestCase):
         c = cr.Candidate(key="API_SECRET", value="Kx7vQm2ZpLr9", hits=447, files=23)
         c.classify(8)
         self.assertEqual(c.verdict, "review")
+
+    def test_entropy_never_overrides_a_benign_key_name(self):
+        """High entropy in an explicitly non-secret key is not a finding."""
+        c = self.classify("services.app.volumes[0]", "aZ4tYuIoPaSdFgHjKlZxCvBnM12345", hits=3)
+        self.assertEqual(c.verdict, "skip")
+        self.assertEqual(c.reason, "benign key name")
+
+    def test_low_entropy_never_overrides_a_credential_key_name(self):
+        """A short simple password is still a password."""
+        c = self.classify("MYSQL_PASSWORD", "hunter22", hits=2)
+        self.assertEqual(c.verdict, "redact")
+        self.assertEqual(c.reason, "credential key name")
+
+    def test_entropy_only_applies_when_key_name_is_silent(self):
+        c = self.classify("blob", "aZ4tYuIoPaSdFgHjKlZxCvBnM12345", hits=2)
+        self.assertEqual(c.verdict, "redact")
+        self.assertTrue(c.reason.startswith("entropy"))
 
     def test_stoplist_values_skipped(self):
         for value in ("admin", "true", "localhost", "postgres", "production"):

@@ -81,7 +81,21 @@ _BENIGN_KEY_BASE = (
     r"working_dir|profiles|replicas|platform|pull_policy|shm_size|"
     # build/toolchain knobs: rustflags, ldflags, compiler args, linker targets
     r"rustflags|cflags|cxxflags|ldflags|cppflags|flags|args|argv|opts|options|"
-    r"linker|rpath|target|features|toolchain|edition|runner|incremental"
+    r"linker|rpath|target|features|toolchain|edition|runner|incremental|"
+    # cloud resource identifiers - names of things, not keys to them
+    r"bucket|region|endpoint|account_?id|zone|project_?id|namespace|cluster"
+)
+
+# Structural containers whose *entire subtree* is configuration, never secrets.
+# Applied to any segment of the key path, unlike the leaf-only checks above.
+# `environment` and `labels` are deliberately NOT here: they hold arbitrary
+# user keys, so a secret ancestor rule would mask real credentials beneath them.
+_BENIGN_SUBTREE_BASE = (
+    r"depends_on|healthcheck|deploy|logging|ulimits|sysctls|extra_hosts|"
+    r"blkio_config|resources|dns|tmpfs|configs|placement|update_config"
+)
+BENIGN_SUBTREE_RE = re.compile(
+    r"(?:^|[._\-/])(?:" + _BENIGN_SUBTREE_BASE + r")(?:$|[._\-/])", re.IGNORECASE
 )
 
 
@@ -260,14 +274,23 @@ class Candidate:
         return leaf or stripped
 
     def classify(self, min_length: int) -> None:
+        """Key name first; entropy only where the key name says nothing.
+
+        Entropy does not discriminate in the middle of its range - measured on
+        real data, a genuine password sits at 3.5 while a Rust linker flag sits
+        at 3.6, an image reference at 3.5 and a volume spec at 4.0. So it never
+        overrides an explicit key name in either direction. It is a tie-breaker
+        for keys that carry no meaning, nothing more.
+
+        Skipping a benign-named key outright is safe because composite values are
+        decomposed upstream: DATABASE_URL is benign, but the password inside it
+        was already extracted as DATABASE_URL.password and judged on its own.
+        """
         v = self.value
         low = v.strip().lower()
         ent = entropy(v)
 
-        leaf = self.leaf_key
-        strong_key = bool(SECRET_KEY_RE.search(leaf))
-        benign_key = bool(BENIGN_KEY_RE.search(leaf)) and not strong_key
-
+        # --- value is not a secret by form, whatever it is called -------------
         if self.hits == 0:
             self.verdict, self.reason = "skip", "not present"
             return
@@ -278,39 +301,45 @@ class Candidate:
             self.verdict, self.reason = "skip", "structural"
             return
 
-        # A strong key name lowers the length floor but never auto-selects a
-        # very short value - those cause the worst collateral damage.
-        floor = 4 if strong_key else min_length
+        leaf = self.leaf_key
+        credential_key = bool(SECRET_KEY_RE.search(leaf))
+        benign_key = not credential_key and (
+            bool(BENIGN_KEY_RE.search(leaf)) or bool(BENIGN_SUBTREE_RE.search(self.key))
+        )
+
+        # A credential key name lowers the length floor - short passwords are
+        # real - but a very short value still causes the worst collateral damage.
+        floor = 4 if credential_key else min_length
         if len(v) < floor:
             self.verdict, self.reason = "skip", f"under {floor} chars"
             return
 
-        # High hit counts mean the value is a common token in the transcript,
-        # not a credential. Measured from the real target, so it catches
-        # low-entropy secrets that the entropy test alone would miss.
-        if self.hits > 25 and not strong_key:
-            self.verdict, self.reason = "skip", f"{self.hits} hits, too common"
-            return
-
-        if strong_key and len(v) >= min_length:
-            # Even a credential-named key is implausible at this spread; a real
-            # secret does not appear in dozens of unrelated files.
+        # --- 1. the key name says "credential" -------------------------------
+        if credential_key:
             if self.hits > 100 and self.files > 10:
                 self.verdict, self.reason = (
-                    "review", f"credential key but {self.hits} hits in {self.files} files")
+                    "review",
+                    f"credential key but {self.hits} hits in {self.files} files",
+                )
             else:
                 self.verdict, self.reason = "redact", "credential key name"
             return
-        # Benign keys are checked before the entropy rule: a linker flag or a
-        # volume spec is high-entropy by nature, and an explicit key name is the
-        # more reliable signal about what the value actually is.
-        if benign_key and ent < 4.5:
+
+        # --- 2. the key name says "not a credential" -------------------------
+        if benign_key:
             self.verdict, self.reason = "skip", "benign key name"
             return
-        if ent >= 3.2 and len(v) >= 16 and charset_classes(v) >= 2 and self.hits <= 10:
+
+        # --- 3. the key name says nothing: fall back to value signals --------
+        # Occurrence count first. It is measured from the user's real files
+        # rather than guessed from the value, so it catches low-entropy secrets
+        # and, more usefully, stops common words being treated as credentials.
+        if self.hits > 25:
+            self.verdict, self.reason = "skip", f"{self.hits} hits, too common"
+            return
+        if ent >= 4.2 and len(v) >= 24 and charset_classes(v) >= 2:
             self.verdict, self.reason = "redact", f"entropy {ent:.1f}"
             return
-
         self.verdict, self.reason = "review", f"entropy {ent:.1f}, {self.hits} hits"
 
     def masked(self, prefix: int = 0) -> str:
