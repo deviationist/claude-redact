@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Executable entry point. All logic lives in claude_redact.py so it is importable
+by the test suite; this file only wires argv to main()."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from claude_redact import main  # noqa: E402
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
