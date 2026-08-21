@@ -641,6 +641,65 @@ def info(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+PROFILE_CONFIG = Path.home() / ".config" / "claude-profile" / "config.json"
+
+
+def load_profile_dirs() -> list[Path]:
+    """Config dirs declared by claude-profile, if it is installed.
+
+    Optional integration, not a dependency: the tool must work for people who
+    have never heard of claude-profile, so this returns [] rather than failing
+    when the config is absent or shaped differently than expected.
+    """
+    if not PROFILE_CONFIG.is_file():
+        return []
+    try:
+        data = json.loads(PROFILE_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        warn(f"ignoring unreadable {PROFILE_CONFIG}: {exc}")
+        return []
+    out: list[Path] = []
+    for name, entry in (data.get("profiles") or {}).items():
+        raw = (entry or {}).get("dir")
+        if not raw:
+            warn(f"profile {name!r} declares no dir; skipping")
+            continue
+        d = Path(raw).expanduser()
+        if d.is_dir():
+            out.append(d)
+        else:
+            warn(f"profile {name!r} dir does not exist: {d}")
+    return out
+
+
+def config_dirs(args: argparse.Namespace) -> list[Path]:
+    """Every Claude Code config dir this run should look at."""
+    roots: list[Path] = []
+    for raw in args.config_dir or []:
+        d = Path(raw).expanduser()
+        if not d.is_dir():
+            die(f"--config-dir is not a directory: {d}")
+        roots.append(d)
+    if args.all_profiles:
+        found = load_profile_dirs()
+        if not found:
+            die(
+                "--all-profiles found no profiles; claude-profile is not "
+                "installed or declares none. Use --config-dir explicitly."
+            )
+        roots.extend(found)
+    if not roots:
+        roots = [CLAUDE_HOME]
+    # de-duplicate by resolved path, preserving order
+    seen, unique = set(), []
+    for r in roots:
+        rp = r.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(r)
+    return unique
+
+
 def encode_cwd(path: Path) -> str:
     """Claude Code's project-dir encoding: '/' and '.' both become '-'."""
     return re.sub(r"[/.]", "-", str(path))
@@ -657,7 +716,7 @@ def session_of(transcript: Path) -> str:
     return transcript.stem
 
 
-def session_targets(transcript: Path) -> list[Path]:
+def session_targets(transcript: Path, root: Path | None = None) -> list[Path]:
     """Every file belonging to one session.
 
     Beyond the .jsonl itself there are two sibling locations, both confirmed on
@@ -669,10 +728,11 @@ def session_targets(transcript: Path) -> list[Path]:
     The second is where a large `cat .env` result ends up, so omitting it would
     leave the credential behind while reporting the session clean.
     """
+    root = root or CLAUDE_HOME
     uuid = session_of(transcript)
     out = [transcript]
     out.extend(iter_files(transcript.parent / uuid))
-    out.extend(iter_files(CLAUDE_HOME / "file-history" / uuid))
+    out.extend(iter_files(root / "file-history" / uuid))
     return out
 
 
@@ -713,53 +773,66 @@ def iter_files(root: Path) -> Iterator[Path]:
 
 
 def resolve_targets(args: argparse.Namespace) -> list[Path]:
-    """Which files this run looks at. --all sweeps everything under CLAUDE_HOME."""
-    targets: list[Path] = []
+    """Which files this run looks at, across every configured Claude config dir.
 
-    if args.all:
-        for name in SWEEP_DIRS:
-            targets.extend(iter_files(CLAUDE_HOME / name))
-    elif args.session:
-        matches = list((CLAUDE_HOME / "projects").glob(f"*/{args.session}.jsonl"))
-        if not matches:
-            die(f"no transcript found for session {args.session}")
-        for m in matches:
-            targets.extend(session_targets(m))
-    else:
-        proj = CLAUDE_HOME / "projects" / encode_cwd(Path.cwd().resolve())
-        newest = _newest(list(proj.glob("*.jsonl"))) if proj.is_dir() else None
-        if args.here and newest is not None:
-            targets.extend(session_targets(newest))
-        else:
-            if args.here:
-                warn("no transcripts for this directory - sweeping everything")
-            # Default: the whole tree. Two reasons, both measured on real data.
-            #
-            # A credential defined in one project is routinely leaked by a
-            # session run somewhere else: values from a project .env turned up
-            # in 24 and 54 unrelated transcripts on a live host.
-            #
-            # More subtly, the "too common" signal is relative to the corpus
-            # scanned, so a narrow scope has too little evidence to dismiss
-            # ordinary tokens - scoping down produced MORE false positives than
-            # a full sweep, which is the opposite of what a user expects.
+    Multiple dirs matter because claude-profile gives a machine one config dir
+    per profile. Scanning only the active profile reports clean while an entire
+    second profile's transcripts go unexamined.
+    """
+    targets: list[Path] = []
+    roots = config_dirs(args)
+    if len(roots) > 1:
+        info(f"scanning {len(roots)} config dirs: " + ", ".join(str(r) for r in roots))
+
+    for root in roots:
+        if args.all:
             for name in SWEEP_DIRS:
-                targets.extend(iter_files(CLAUDE_HOME / name))
+                targets.extend(iter_files(root / name))
+        elif args.session:
+            matches = list((root / "projects").glob(f"*/{args.session}.jsonl"))
+            for m in matches:
+                targets.extend(session_targets(m, root))
+        else:
+            proj = root / "projects" / encode_cwd(Path.cwd().resolve())
+            newest = _newest(list(proj.glob("*.jsonl"))) if proj.is_dir() else None
+            if args.here and newest is not None:
+                targets.extend(session_targets(newest, root))
+            else:
+                if args.here:
+                    warn(
+                        f"no transcripts for this directory under {root} - "
+                        "sweeping everything"
+                    )
+                # Default: the whole tree. Two reasons, both measured on real data.
+                #
+                # A credential defined in one project is routinely leaked by a
+                # session run somewhere else: values from a project .env turned
+                # up in 24 and 54 unrelated transcripts on a live host.
+                #
+                # More subtly, the "too common" signal is relative to the corpus
+                # scanned, so a narrow scope has too little evidence to dismiss
+                # ordinary tokens - scoping down produced MORE false positives
+                # than a full sweep, which is the opposite of what users expect.
+                for name in SWEEP_DIRS:
+                    targets.extend(iter_files(root / name))
+
+    if args.session and not targets:
+        die(f"no transcript found for session {args.session}")
 
     for extra in args.path or []:
-        p = Path(extra).expanduser()
-        if not p.exists():
-            die(f"--path does not exist: {p}")
-        targets.extend(iter_files(p))
+        pth = Path(extra).expanduser()
+        if not pth.exists():
+            die(f"--path does not exist: {pth}")
+        targets.extend(iter_files(pth))
 
     # de-duplicate, preserve order
     seen: set[Path] = set()
     out = []
-    for p in targets:
-        rp = p.resolve()
+    for pth in targets:
+        rp = pth.resolve()
         if rp not in seen:
             seen.add(rp)
-            out.append(p)
+            out.append(pth)
     return out
 
 
@@ -1406,6 +1479,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="only this directory's newest session. Faster, but note that the "
         "'too common' signal needs a broad corpus to work - a narrow scope "
         "reports more false positives, not fewer",
+    )
+    scope.add_argument(
+        "--config-dir",
+        action="append",
+        metavar="DIR",
+        help="a Claude Code config dir to scan (default: $CLAUDE_CONFIG_DIR or "
+        "~/.claude). Repeatable - useful when several profiles each have one.",
+    )
+    scope.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help="scan every config dir declared by claude-profile, if installed",
     )
     scope.add_argument(
         "--path",

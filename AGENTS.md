@@ -10,7 +10,7 @@ milestone two and does not exist yet; do not describe it as if it does.
 |---|---|
 | `claude-redact` | Executable shim. Wires argv to `main()`, nothing else. |
 | `claude_redact.py` | All logic. Kept importable so the tests can reach it — this is why the shim exists. |
-| `tests/test_claude_redact.py` | 129 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
+| `tests/test_claude_redact.py` | 139 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
 
 No dependencies, and it should stay that way. PyYAML is used **if importable**
 and otherwise falls through to the line scanner — never add it as a requirement.
@@ -30,7 +30,8 @@ Targets Python 3.9+; `tomllib` is guarded behind `try/import`.
   credentials.
 - **Config discovery** — `find_config_files` walks a tree for `CONFIG_GLOBS`,
   honouring `--exclude`, `EXAMPLE_GLOBS` and `.claude-redactignore`.
-- **Scope** — `resolve_targets`, `session_targets`, `encode_cwd`.
+- **Scope** — `resolve_targets`, `session_targets`, `encode_cwd`, `config_dirs`,
+  `load_profile_dirs`.
 - **Scanning** — `scan` / `count_in_file` for known values, `discover` for
   credential shapes.
 - **CLI** — `build_parser`, `main`, `report`, `report_discovery`.
@@ -135,6 +136,19 @@ entry. Most-specific first — `anthropic_key` must precede `openai_key`.
   escapes (`_NEEDS_PARSE_RE`). Otherwise the raw text is searched directly.
   Discovery never parses JSON at all — credential shapes contain no escapable
   characters.
+
+## Multiple config dirs
+
+`resolve_targets` iterates every dir from `config_dirs()`, because a machine
+running several Claude Code profiles has one config dir per profile and scanning
+only the active one reports clean while another profile goes unexamined.
+`session_targets` therefore takes its root explicitly — resolving `file-history/`
+against the module-level `CLAUDE_HOME` would silently look in the wrong profile.
+
+`load_profile_dirs()` reads `claude-profile`'s config when present. It is an
+**optional integration, never a dependency**: it returns `[]` for an absent or
+malformed config and warns rather than failing, so the tool works for people who
+have never heard of that project.
 
 ## Where a session's data actually lives
 

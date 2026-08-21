@@ -105,7 +105,24 @@ buries real findings in noise.
 | *(default)*, `--all` | Everything under `~/.claude`: `projects/`, `file-history/`, `history.jsonl`, `paste-cache/`, `shell-snapshots/`, `backups/`, `debug/`, `todos/` |
 | `--session UUID` | One specific session and everything belonging to it |
 | `--here` | Only the current directory's newest session |
+| `--config-dir DIR` | A Claude Code config dir to scan (repeatable) |
+| `--all-profiles` | Every config dir declared by `claude-profile`, if installed |
 | `--path P` | Any extra file or directory (repeatable) — combine with any of the above |
+
+### Multiple profiles
+
+By default the scan looks at `$CLAUDE_CONFIG_DIR`, or `~/.claude`. Tools that
+run several Claude Code profiles side by side give each one its own config dir,
+and scanning only the active one reports clean while a second profile's
+transcripts go completely unexamined.
+
+```bash
+claude-redact --config-dir ~/.claude --config-dir ~/.claude-work
+```
+
+If [`claude-profile`](https://github.com/deviationist/claude-profile) is
+installed, `--all-profiles` reads the dirs straight from its config. That is an
+optional integration, not a dependency — the tool works fine without it.
 
 **The full sweep is the default, and narrowing has a counter-intuitive cost.**
 The "too common" signal is measured against the corpus you scan, so a narrow

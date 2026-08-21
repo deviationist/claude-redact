@@ -828,6 +828,125 @@ class TestCLI(TempTree):
 
 
 # ---------------------------------------------------------------------------
+# multiple config dirs (claude-profile)
+# ---------------------------------------------------------------------------
+
+
+class TestConfigDirs(TempTree):
+    def setUp(self):
+        super().setUp()
+        self._orig = cr.CLAUDE_HOME
+        self.addCleanup(lambda: setattr(cr, "CLAUDE_HOME", self._orig))
+        self.a = self.root / "profileA"
+        self.b = self.root / "profileB"
+        for home, secret in ((self.a, "Kx7vQm2ZpLr9WtBn"), (self.b, "Zx9KpQm2VnLr7Wtc")):
+            d = home / "projects" / "-tmp-proj"
+            d.mkdir(parents=True)
+            (d / "aaaa-bbbb.jsonl").write_text(
+                json.dumps({"m": f"leaked {secret}"}) + "\n")
+        cr.CLAUDE_HOME = self.a
+
+    def run_cli(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cr.main(argv)
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_default_scans_only_the_active_config_dir(self):
+        code, _, _ = self.run_cli(["--value", "Zx9KpQm2VnLr7Wtc", "--all"])
+        self.assertEqual(code, 0, "profileB must not be scanned by default")
+
+    def test_config_dir_flag_reaches_another_profile(self):
+        code, _, _ = self.run_cli(
+            ["--value", "Zx9KpQm2VnLr7Wtc", "--all", "--config-dir", str(self.b)])
+        self.assertEqual(code, 1)
+
+    def test_multiple_config_dirs_are_scanned_together(self):
+        _, out, _ = self.run_cli([
+            "--value", "Kx7vQm2ZpLr9WtBn", "--value", "Zx9KpQm2VnLr7Wtc", "--all",
+            "--config-dir", str(self.a), "--config-dir", str(self.b), "--json"])
+        self.assertEqual(len(json.loads(out)["findings"]), 2)
+
+    def test_duplicate_config_dirs_are_deduplicated(self):
+        _, out, _ = self.run_cli([
+            "--value", "Kx7vQm2ZpLr9WtBn", "--all", "--json",
+            "--config-dir", str(self.a), "--config-dir", str(self.a)])
+        finding = json.loads(out)["findings"][0]
+        self.assertEqual(finding["hits"], 1, "file scanned twice")
+
+    def test_missing_config_dir_is_an_error(self):
+        code, _, err = self.run_cli(
+            ["--value", "x", "--config-dir", str(self.root / "nope")])
+        self.assertEqual(code, 2)
+        self.assertIn("not a directory", err)
+
+    def test_file_history_resolves_per_config_dir(self):
+        fh = self.b / "file-history" / "aaaa-bbbb"
+        fh.mkdir(parents=True)
+        (fh / "snap@v1").write_text("Zx9KpQm2VnLr7Wtc\n")
+        t = self.b / "projects" / "-tmp-proj" / "aaaa-bbbb.jsonl"
+        found = cr.session_targets(t, self.b)
+        self.assertIn("snap@v1", {p.name for p in found})
+
+    def test_profile_dirs_absent_config_returns_empty(self):
+        orig = cr.PROFILE_CONFIG
+        cr.PROFILE_CONFIG = self.root / "no-such-config.json"
+        try:
+            self.assertEqual(cr.load_profile_dirs(), [])
+        finally:
+            cr.PROFILE_CONFIG = orig
+
+    def test_profile_dirs_parsed_from_config(self):
+        cfg = self.root / "profiles.json"
+        cfg.write_text(json.dumps({
+            "default_profile": "personal",
+            "profiles": {
+                "personal": {"dir": str(self.a)},
+                "work": {"dir": str(self.b)},
+                "broken": {"dir": str(self.root / "gone")},
+                "nodir": {},
+            },
+        }))
+        orig = cr.PROFILE_CONFIG
+        cr.PROFILE_CONFIG = cfg
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                dirs = cr.load_profile_dirs()
+        finally:
+            cr.PROFILE_CONFIG = orig
+        self.assertEqual({str(d) for d in dirs}, {str(self.a), str(self.b)})
+        self.assertIn("does not exist", err.getvalue())
+        self.assertIn("declares no dir", err.getvalue())
+
+    def test_malformed_profile_config_is_not_fatal(self):
+        cfg = self.root / "bad.json"
+        cfg.write_text("{not json")
+        orig = cr.PROFILE_CONFIG
+        cr.PROFILE_CONFIG = cfg
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cr.load_profile_dirs(), [])
+        finally:
+            cr.PROFILE_CONFIG = orig
+        self.assertIn("unreadable", err.getvalue())
+
+    def test_all_profiles_errors_when_none_declared(self):
+        orig = cr.PROFILE_CONFIG
+        cr.PROFILE_CONFIG = self.root / "absent.json"
+        try:
+            code, _, err = self.run_cli(["--value", "x", "--all-profiles"])
+        finally:
+            cr.PROFILE_CONFIG = orig
+        self.assertEqual(code, 2)
+        self.assertIn("no profiles", err)
+
+
+# ---------------------------------------------------------------------------
 # json output
 # ---------------------------------------------------------------------------
 
