@@ -128,6 +128,12 @@ DURATION_RE = re.compile(r"^\d+(?:ms|s|m|h|d|w|[kmgt]i?b?)$", re.IGNORECASE)
 PATH_RE = re.compile(r"^(?:\.{0,2}/|~/|[a-z]:\\)")
 TZ_RE = re.compile(r"^[A-Z][a-z]+/[A-Z]")
 IMAGE_REF_RE = re.compile(r"^[a-z0-9._\-]+(?:/[a-z0-9._\-]+)+:[a-z0-9._\-]+$")
+# A shell or compose interpolation names where a secret lives; it is not the
+# secret. `${DB_PASSWORD:?set DB_PASSWORD in .env}` is a pointer plus an error
+# message, and there is nothing in it to redact.
+INTERPOLATION_RE = re.compile(
+    r"^\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)$"
+)
 # Docker volume/bind specs: "named_vol:/in/container", "/on/host:/in/container".
 VOLUME_SPEC_RE = re.compile(r"^[\w./\-${}]+:/[\w./\-]+(?::(?:ro|rw|z|Z|r?slave|r?shared))?$")
 # Linux capability lists (cap_add), e.g. NET_ADMIN or SYS_ADMIN,NET_RAW.
@@ -233,6 +239,7 @@ def looks_structural(value: str) -> bool:
         or SEMVER_RE.match(v)
         or VOLUME_SPEC_RE.match(v)
         or CAP_LIST_RE.match(v)
+        or INTERPOLATION_RE.match(v)
     )
 
 

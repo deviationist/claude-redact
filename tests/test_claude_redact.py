@@ -174,6 +174,22 @@ class TestClassification(unittest.TestCase):
             self.assertRegex(plain, r"(redact|review)\s{3,}\S",
                              "verdict column lost its padding")
 
+    def test_interpolations_are_not_secrets(self):
+        """Regression: compose declared SLSKD_SLSK_PASSWORD twice - once with the
+        real value in .env, once as ${SLSKD_SLSK_PASSWORD:?...} in the compose
+        file. The interpolation names where the secret lives; it is not one."""
+        for v in ("${SLSKD_SLSK_PASSWORD:?set SLSKD_SLSK_PASSWORD in .env}",
+                  "${DB_PASSWORD}", "${DB_PASSWORD:-fallback}",
+                  "$MYSQL_ROOT_PASSWORD", "$(cat /run/secrets/pw)"):
+            with self.subTest(v=v):
+                self.assertTrue(cr.looks_structural(v), f"{v!r} should be structural")
+                c = self.classify("MYSQL_PASSWORD", v, hits=14)
+                self.assertEqual(c.verdict, "skip")
+
+    def test_real_secret_beside_its_interpolation_still_found(self):
+        c = self.classify("MYSQL_PASSWORD", "Kx7vQm2ZpLr9WtBn", hits=14)
+        self.assertEqual(c.verdict, "redact")
+
     def test_docker_volume_specs_are_structural(self):
         for v in ("ollama_data:/root/.ollama", "/srv/data:/data:ro",
                   "./config:/etc/app", "${PWD}/x:/x"):
