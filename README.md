@@ -34,8 +34,17 @@ ln -s ~/.zsh/claude-redact/claude-redact ~/.local/bin/claude-redact
 
 ### Audit a project's configs against your transcripts
 
-Walks a tree, finds every config file that plausibly holds secrets, extracts
-their values, and reports which ones appear in your Claude Code state:
+With no arguments it does the obvious thing: finds every config file in the
+current directory that plausibly holds secrets, extracts their values, and
+reports which ones appear in your Claude Code state.
+
+```bash
+cd ~/code/myproject
+claude-redact
+```
+
+Only candidates that look like credentials are listed; `-v` adds the ones
+classified benign. To audit a tree you are not standing in:
 
 ```bash
 claude-redact --from-dir ~/code/myproject --all
@@ -93,7 +102,7 @@ buries real findings in noise.
 
 | Flag | Scans |
 |---|---|
-| *(default)* | The newest transcript for the current directory, plus everything else belonging to that session (see below) |
+| *(default)* | The newest transcript for the current directory, plus everything else belonging to that session (see below). If the directory has no sessions, falls back to `--all` — a credential defined here may have leaked from elsewhere |
 | `--session UUID` | One specific session, same coverage |
 | `--all` | Everything under `~/.claude`: `projects/`, `file-history/`, `history.jsonl`, `paste-cache/`, `shell-snapshots/`, `backups/`, `debug/`, `todos/` |
 | `--path P` | Any extra file or directory (repeatable) — combine with any of the above |

@@ -586,15 +586,19 @@ def resolve_targets(args: argparse.Namespace) -> list[Path]:
             targets.extend(session_targets(m))
     else:
         proj = CLAUDE_HOME / "projects" / encode_cwd(Path.cwd().resolve())
-        if not proj.is_dir():
-            die(
-                f"no transcripts for this directory ({proj.name}).\n"
-                "       use --session UUID, --all, or --path to widen the scope."
-            )
-        newest = _newest(list(proj.glob("*.jsonl")))
+        newest = _newest(list(proj.glob("*.jsonl"))) if proj.is_dir() else None
         if newest is None:
-            die(f"no .jsonl transcripts in {proj}")
-        targets.extend(session_targets(newest))
+            # A credential defined here may well have leaked in a session run
+            # from somewhere else entirely, so an empty local scope is a reason
+            # to widen rather than to give up.
+            warn(
+                "no transcripts for this directory - sweeping all of "
+                f"{CLAUDE_HOME} instead (--session UUID to narrow)"
+            )
+            for name in SWEEP_DIRS:
+                targets.extend(iter_files(CLAUDE_HOME / name))
+        else:
+            targets.extend(session_targets(newest))
 
     for extra in args.path or []:
         p = Path(extra).expanduser()
@@ -1104,6 +1108,7 @@ def report(
     res: ScanResult,
     targets: Sequence[Path],
     show_prefix: int,
+    verbose: bool = False,
 ) -> None:
     present = [c for c in cands if c.hits > 0]
     info(
@@ -1116,6 +1121,15 @@ def report(
         return
 
     interesting = [c for c in present if c.verdict != "skip"]
+    shown = present if verbose else interesting
+
+    if not shown:
+        print(
+            _c("1;32", "clean")
+            + f" — {len(present)} value(s) present but all classified benign"
+            + " (--verbose to list them)"
+        )
+        return
 
     print()
     print(
@@ -1123,7 +1137,7 @@ def report(
         f"{'VERDICT':<8} REASON"
     )
     print(f"  {'-' * 28} {'-' * 4} {'-' * 5} {'-' * 5} {'-' * 6}  {'-' * 8} {'-' * 20}")
-    for c in sorted(present, key=lambda c: (c.verdict != "redact", c.verdict != "review", -c.hits)):
+    for c in sorted(shown, key=lambda c: (c.verdict != "redact", c.verdict != "review", -c.hits)):
         colour = {"redact": "1;31", "review": "1;33"}.get(c.verdict, "2")
         print(
             f"  {c.key[:28]:<28} {len(c.value):>4} {entropy(c.value):>5.1f} "
@@ -1148,16 +1162,9 @@ def report(
             print(f"    ... and {len(locs) - 8} more")
 
     print()
-    if interesting:
-        print(
-            _c("1;31", f"{len(interesting)} value(s) worth attention")
-            + f" ({len(present) - len(interesting)} present but classified benign)"
-        )
-    else:
-        print(
-            _c("1;32", "no credentials detected")
-            + f" — {len(present)} value(s) present but all classified benign"
-        )
+    benign = len(present) - len(interesting)
+    suffix = f" ({benign} present but classified benign)" if benign else ""
+    print(_c("1;31", f"{len(interesting)} value(s) worth attention") + suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -1263,6 +1270,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="reveal the first N characters of each value (default: 0). "
         "Anything shown here is written into the transcript you are reading.",
     )
+    out.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="also list candidates classified benign (hidden by default)",
+    )
     out.add_argument("--json", action="store_true", help="machine-readable output")
     out.add_argument("--version", action="version", version=f"claude-redact {__version__}")
     return p
@@ -1272,8 +1284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if not any((args.from_file, args.from_dir, args.value, args.discover)):
-        build_parser().print_help(sys.stderr)
-        return 2
+        # The overwhelmingly common intent is "audit this project's configs".
+        # Requiring --from-dir . to express that is friction for no benefit.
+        args.from_dir = ["."]
     if args.discover and (args.from_file or args.from_dir or args.value):
         die("--discover takes no reference values; drop --from-file/--from-dir/--value")
     if args.value and (args.from_file or args.from_dir):
@@ -1398,7 +1411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     else:
-        report(cands, res, targets, args.show_prefix)
+        report(cands, res, targets, args.show_prefix, args.verbose)
 
     return 1 if any(c.hits > 0 for c in cands) else 0
 

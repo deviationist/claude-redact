@@ -608,10 +608,33 @@ class TestCLI(TempTree):
         self.assertEqual(code, 2)
         self.assertIn("not a file", err)
 
-    def test_no_arguments_prints_help(self):
-        code, _, err = self.run_cli([])
-        self.assertEqual(code, 2)
-        self.assertIn("usage", err.lower())
+    def test_no_source_defaults_to_current_directory(self):
+        """`claude-redact --all` from a project should just audit that project."""
+        import os
+        proj = self.root / "proj"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text("MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")
+        self.transcript("leaked Kx7vQm2ZpLr9WtBn here")
+        cwd = os.getcwd()
+        os.chdir(proj)
+        try:
+            code, out, _ = self.run_cli(["--all"])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 1)
+        self.assertIn("MYSQL_PASSWORD", out)
+
+    def test_benign_rows_hidden_unless_verbose(self):
+        proj = self.root / "proj2"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text(
+            "MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\nTZ=Europe/Oslo\n")
+        self.transcript("leaked Kx7vQm2ZpLr9WtBn in Europe/Oslo")
+        quiet = self.run_cli(["--from-dir", str(proj), "--all"])[1]
+        loud = self.run_cli(["--from-dir", str(proj), "--all", "--verbose"])[1]
+        self.assertNotIn("TZ", quiet)
+        self.assertIn("TZ", loud)
+        self.assertIn("MYSQL_PASSWORD", quiet)
 
     def test_list_sources_exits_without_scanning(self):
         self.write("proj/.env", "K=Kx7vQm2ZpLr9WtBn\n")
