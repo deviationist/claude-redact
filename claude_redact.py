@@ -658,6 +658,9 @@ SELF_DIR = Path(__file__).resolve().parent
 # the repos are not siblings.
 
 
+PROFILE_CMD_TIMEOUT = 15.0
+
+
 def _profile_cmd(argv: Sequence[str]) -> "str | None":
     """Run a claude-profile subcommand. None when it is not installed."""
     import shutil
@@ -683,7 +686,7 @@ def _profile_cmd(argv: Sequence[str]) -> "str | None":
                 base + list(argv),
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=PROFILE_CMD_TIMEOUT,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):

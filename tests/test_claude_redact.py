@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import re
 import sys
 import tempfile
@@ -1039,6 +1040,102 @@ class TestConfigDirs(TempTree):
                 str(d).startswith(str(self.root)),
                 f"{d} escapes the fixture tree",
             )
+
+    def script(self, body: str) -> pathlib.Path:
+        f = self.root / "prof_script.py"
+        f.write_text(body)
+        return f
+
+    def use_script(self, path):
+        import os
+        old = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+        os.environ["CLAUDE_PROFILE_SCRIPT"] = str(path)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("CLAUDE_PROFILE_SCRIPT", old)
+            if old is not None
+            else os.environ.pop("CLAUDE_PROFILE_SCRIPT", None)
+        )
+
+    def test_nonzero_exit_is_treated_as_no_answer(self):
+        """claude-profile failing must degrade, not propagate."""
+        self.use_script(self.script("import sys\nsys.stdout.write('x\\ty\\t')\nsys.exit(3)\n"))
+        self.assertIsNone(cr._profile_cmd(["list"]))
+
+    def test_empty_output_is_treated_as_no_answer(self):
+        self.use_script(self.script("pass\n"))
+        self.assertIsNone(cr._profile_cmd(["list"]))
+
+    def test_hanging_claude_profile_times_out(self):
+        """A hung dependency must not hang the scan."""
+        self.use_script(self.script("import time\ntime.sleep(30)\n"))
+        old = cr.PROFILE_CMD_TIMEOUT
+        cr.PROFILE_CMD_TIMEOUT = 0.5
+        self.addCleanup(lambda: setattr(cr, "PROFILE_CMD_TIMEOUT", old))
+        import time as _t
+        start = _t.monotonic()
+        self.assertIsNone(cr._profile_cmd(["list"]))
+        self.assertLess(_t.monotonic() - start, 10, "timeout not honoured")
+
+    def test_crashing_claude_profile_is_survived(self):
+        self.use_script(self.script("raise SystemExit(1)\n"))
+        self.assertIsNone(cr._profile_cmd(["list"]))
+
+    def test_claude_profile_on_path_is_used(self):
+        """The PATH candidate, used when claude-profile is a real executable."""
+        import os, stat
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        exe = bindir / "claude-profile"
+        exe.write_text(f"#!{sys.executable}\nprint('personal\\t{self.a}\\tactive')\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        old_env = os.environ.get("CLAUDE_PROFILE_SCRIPT")
+        old_path = os.environ["PATH"]
+        os.environ.pop("CLAUDE_PROFILE_SCRIPT", None)
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{old_path}"
+        try:
+            dirs = cr.load_profile_dirs()
+        finally:
+            os.environ["PATH"] = old_path
+            if old_env is not None:
+                os.environ["CLAUDE_PROFILE_SCRIPT"] = old_env
+        self.assertEqual([str(d) for d in dirs], [str(self.a)])
+
+    def test_active_profile_without_claude_profile_warns(self):
+        with self.fake_profile(None):
+            _, _, err = self.run_cli(
+                ["--value", "zzz", "--all", "--active-profile"])
+        self.assertIn("has no effect", err)
+
+    def test_env_var_accepts_multiple_pathsep_separated_dirs(self):
+        import os
+        old = os.environ.get("CLAUDE_REDACT_PROFILE_DIRS")
+        os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = f"{self.a}{os.pathsep}{self.b}"
+        try:
+            with self.fake_profile(None):
+                _, out, _ = self.run_cli([
+                    "--value", "Kx7vQm2ZpLr9WtBn", "--value", "Zx9KpQm2VnLr7Wtc",
+                    "--all", "--json"])
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_REDACT_PROFILE_DIRS", None)
+            else:
+                os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = old
+        self.assertEqual(len(json.loads(out)["findings"]), 2)
+
+    def test_env_var_bad_entry_warns_and_is_dropped(self):
+        import os
+        old = os.environ.get("CLAUDE_REDACT_PROFILE_DIRS")
+        os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = f"{self.root / 'gone'}{os.pathsep}{self.a}"
+        try:
+            with self.fake_profile(None):
+                code, _, err = self.run_cli(["--value", "Kx7vQm2ZpLr9WtBn", "--all"])
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_REDACT_PROFILE_DIRS", None)
+            else:
+                os.environ["CLAUDE_REDACT_PROFILE_DIRS"] = old
+        self.assertEqual(code, 1, "the good dir must still be scanned")
+        self.assertIn("does not exist", err)
 
     def test_profile_script_override_is_authoritative(self):
         """If the user says where claude-profile lives and it is not there, it
