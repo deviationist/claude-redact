@@ -79,6 +79,8 @@ _BENIGN_KEY_BASE = (
     r"image|command|entrypoint|container_name|volumes|networks|ports|"
     r"depends_on|restart|labels|cap_add|cap_drop|devices|healthcheck|"
     r"working_dir|profiles|replicas|platform|pull_policy|shm_size|"
+    r"security_opt|pids_limit|group_add|read_only|init|stop_grace_period|"
+    r"mem_limit|cpus|cpuset|oom_score_adj|stdin_open|tty|privileged|"
     # build/toolchain knobs: rustflags, ldflags, compiler args, linker targets
     r"rustflags|cflags|cxxflags|ldflags|cppflags|flags|args|argv|opts|options|"
     r"linker|rpath|target|features|toolchain|edition|runner|incremental|"
@@ -1201,7 +1203,7 @@ def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) 
     print(f"  {'-' * 22} {'-' * 5} {'-' * 6}  {'-' * 30}")
     for f in findings:
         print(
-            f"  {_c('1;31', f.kind[:22]):<22} {f.hits:>5} {len(f.files):>6}  "
+            f"  {_c('1;31', f'{f.kind[:22]:<22}')} {f.hits:>5} {len(f.files):>6}  "
             f"{f.masked(prefix)}"
         )
 
@@ -1271,10 +1273,13 @@ def report(
     print(f"  {'-' * 28} {'-' * 4} {'-' * 5} {'-' * 5} {'-' * 6}  {'-' * 8} {'-' * 20}")
     for c in sorted(shown, key=lambda c: (c.verdict != "redact", c.verdict != "review", -c.hits)):
         colour = {"redact": "1;31", "review": "1;33"}.get(c.verdict, "2")
+        # Pad before colourising: ANSI escapes count toward str width, so
+        # padding a coloured string collapses the column on a real terminal.
+        verdict_cell = _c(colour, f"{c.verdict:<8}")
         print(
             f"  {c.key[:28]:<28} {len(c.value):>4} {entropy(c.value):>5.1f} "
             f"{c.hits:>5} {len(res.locations[c.value]):>6}  "
-            f"{_c(colour, c.verdict):<8} {c.reason}"
+            f"{verdict_cell} {c.reason}"
         )
         if show_prefix:
             print(f"    {'':<28} value: {c.masked(show_prefix)}")
@@ -1295,8 +1300,15 @@ def report(
 
     print()
     benign = len(present) - len(interesting)
-    suffix = f" ({benign} present but classified benign)" if benign else ""
-    print(_c("1;31", f"{len(interesting)} value(s) worth attention") + suffix)
+    if interesting:
+        suffix = f" ({benign} present but classified benign)" if benign else ""
+        print(_c("1;31", f"{len(interesting)} value(s) worth attention") + suffix)
+    else:
+        # --verbose lists benign rows, but listing them is not a finding.
+        print(
+            _c("1;32", "clean")
+            + f" — {len(present)} value(s) present but all classified benign"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1320,8 +1332,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "exit codes:\n"
-            "  0  clean - nothing found\n"
-            "  1  one or more candidate values present\n"
+            "  0  clean - nothing worth attention\n"
+            "  1  one or more findings (redact or review)\n"
             "  2  error\n"
         ),
     )
@@ -1590,5 +1602,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         report(cands, res, targets, args.show_prefix, args.verbose)
 
-    return 1 if any(c.hits > 0 for c in cands) else 0
+    # Exit non-zero only for something worth a human's attention. "A value from
+    # the config appears somewhere" is true of PUID=1000 on every host, so using
+    # mere presence would make `claude-redact || notify` fire forever.
+    return 1 if any(c.verdict in ("redact", "review") for c in cands) else 0
 

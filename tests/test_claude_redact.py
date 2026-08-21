@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -137,6 +138,24 @@ class TestClassification(unittest.TestCase):
                 c = cr.Candidate(key=key, value="my-app-storage", hits=13)
                 c.classify(8)
                 self.assertEqual(c.verdict, "skip")
+
+    def test_verdict_column_padding_survives_colour(self):
+        """ANSI escapes must not be counted toward the column width."""
+        import io, contextlib
+        cands = [cr.Candidate(key="K", value="Kx7vQm2ZpLr9WtBn", hits=1)]
+        cands[0].classify(8)
+        res = cr.ScanResult(counts={"Kx7vQm2ZpLr9WtBn": 1},
+                            locations={"Kx7vQm2ZpLr9WtBn": [Path("/x")]},
+                            files_scanned=1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cr.report(cands, res, [], 0)
+        rows = [l for l in out.getvalue().splitlines() if " redact" in l or " review" in l]
+        self.assertTrue(rows)
+        for row in rows:
+            plain = re.sub(r"\033\[[0-9;]*m", "", row)
+            self.assertRegex(plain, r"(redact|review)\s{3,}\S",
+                             "verdict column lost its padding")
 
     def test_docker_volume_specs_are_structural(self):
         for v in ("ollama_data:/root/.ollama", "/srv/data:/data:ro",
@@ -718,6 +737,25 @@ class TestCLI(TempTree):
         finally:
             os.chdir(cwd)
         self.assertIn("no transcripts for this directory", err)
+
+    def test_verbose_with_no_findings_reports_clean_not_red(self):
+        """Regression: --verbose showed benign rows, so the summary took the
+        'worth attention' branch and printed '0 value(s) worth attention'."""
+        proj = self.root / "proj5"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text("PUID=1000\nTZ=Europe/Oslo\n")
+        self.transcript("PUID=1000 and TZ=Europe/Oslo appear here")
+        code, out, _ = self.run_cli(["--from-dir", str(proj), "--all", "--verbose"])
+        self.assertIn("clean", out)
+        self.assertNotIn("worth attention", out)
+        self.assertEqual(code, 0, "benign-only presence must not exit non-zero")
+
+    def test_exit_code_tracks_findings_not_presence(self):
+        proj = self.root / "proj6"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text("TZ=Europe/Oslo\n")
+        self.transcript("TZ=Europe/Oslo is here")
+        self.assertEqual(self.run_cli(["--from-dir", str(proj), "--all"])[0], 0)
 
     def test_benign_rows_hidden_unless_verbose(self):
         proj = self.root / "proj2"

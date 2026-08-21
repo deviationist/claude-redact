@@ -239,9 +239,12 @@ they bypass it silently. Scanning is how you find out.
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean — nothing found |
-| `1` | One or more candidate values present |
+| `0` | Clean — nothing worth attention |
+| `1` | One or more findings (`redact` or `review`) |
 | `2` | Error |
+
+Presence alone is not a finding: `PUID=1000` appears in every transcript on
+every host, so an exit code keyed on presence would fire forever.
 
 Suitable for a cron audit: `claude-redact --discover --all || notify`.
 
