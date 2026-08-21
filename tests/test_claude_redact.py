@@ -146,7 +146,7 @@ class TestClassification(unittest.TestCase):
             p = Path(d) / "docker-compose.yml"
             p.write_text("services:\n  app:\n    command: run --dsn "
                          "mysql://svc:Kx7vQm2ZpLr9WtBn@db/app\n")
-            values = {c.value for c in cr.extract_candidates(p, 8)}
+            values = {c.value for c in cr.extract_candidates(p)}
         self.assertIn("Kx7vQm2ZpLr9WtBn", values)
 
     def test_cloud_resource_names_are_benign(self):
@@ -292,10 +292,10 @@ class TestPlaceholderLabel(unittest.TestCase):
 
 class TestDotenvExtraction(TempTree):
     def values(self, path):
-        return {c.value for c in cr.extract_candidates(path, 8)}
+        return {c.value for c in cr.extract_candidates(path)}
 
     def keys_for(self, path, value):
-        return {c.key for c in cr.extract_candidates(path, 8) if c.value == value}
+        return {c.key for c in cr.extract_candidates(path) if c.value == value}
 
     def test_basic_pairs_and_quotes(self):
         p = self.write(".env", "\n".join([
@@ -328,12 +328,12 @@ class TestDotenvExtraction(TempTree):
 
 class TestStructuredExtraction(TempTree):
     def values(self, path):
-        return {c.value for c in cr.extract_candidates(path, 8)}
+        return {c.value for c in cr.extract_candidates(path)}
 
     def test_json_nested_keys(self):
         p = self.write("config.json", json.dumps(
             {"database": {"password": "Kx7vQm2ZpLr9WtBn", "port": 5432}}))
-        cands = cr.extract_candidates(p, 8)
+        cands = cr.extract_candidates(p)
         match = [c for c in cands if c.value == "Kx7vQm2ZpLr9WtBn"]
         self.assertTrue(match)
         self.assertIn("password", match[0].key)
@@ -362,7 +362,7 @@ class TestStructuredExtraction(TempTree):
             "      - PUID=1000", "      - TZ=Europe/Oslo",
             "      - APP_SECRET=Kx7vQm2ZpLr9WtBn",
         ]))
-        cands = {c.key: c for c in cr.extract_candidates(p, 8)}
+        cands = {c.key: c for c in cr.extract_candidates(p)}
         self.assertIn("APP_SECRET", cands)
         self.assertEqual(cands["APP_SECRET"].value, "Kx7vQm2ZpLr9WtBn")
         self.assertNotIn("PUID=1000", {c.value for c in cands.values()})
@@ -401,7 +401,7 @@ class TestEmbeddedCredentials(TempTree):
     def test_url_password_surfaces_from_a_real_file(self):
         p = self.root / ".env"
         p.write_text("DATABASE_URL=mysql://svc:hunter2pass@db.internal/app\n")
-        self.assertIn("hunter2pass", {c.value for c in cr.extract_candidates(p, 8)})
+        self.assertIn("hunter2pass", {c.value for c in cr.extract_candidates(p)})
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +825,267 @@ class TestCLI(TempTree):
         self.assertEqual(code, 1)
         self.assertIn("MYSQL_PASSWORD", out)
         self.assertIn("POSTGRES_PASSWORD", out)
+
+
+# ---------------------------------------------------------------------------
+# json output
+# ---------------------------------------------------------------------------
+
+
+class TestJsonOutput(TempTree):
+    def setUp(self):
+        super().setUp()
+        self.claude_home = self.root / "claude"
+        (self.claude_home / "projects" / "-tmp-proj").mkdir(parents=True)
+        self._orig = cr.CLAUDE_HOME
+        cr.CLAUDE_HOME = self.claude_home
+        self.addCleanup(lambda: setattr(cr, "CLAUDE_HOME", self._orig))
+
+    def transcript(self, content):
+        p = self.claude_home / "projects" / "-tmp-proj" / "aaaa-bbbb.jsonl"
+        p.write_text(json.dumps({"type": "user", "message": content}) + "\n")
+        return p
+
+    def run_cli(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cr.main(argv)
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_known_value_json_shape(self):
+        secret = "Kx7vQm2ZpLr9WtBn"
+        self.transcript(f"leaked {secret}")
+        env = self.write("proj/.env", f"MYSQL_PASSWORD={secret}\n")
+        code, out, _ = self.run_cli(["--from-file", str(env), "--all", "--json"])
+        payload = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertIn("files_scanned", payload)
+        self.assertIn("bytes_scanned", payload)
+        f = payload["findings"][0]
+        for key in ("key", "length", "entropy", "hits", "files", "verdict", "reason"):
+            self.assertIn(key, f)
+        self.assertEqual(f["key"], "MYSQL_PASSWORD")
+        self.assertEqual(f["length"], len(secret))
+        self.assertNotIn(secret, out)
+
+    def test_discover_json_shape(self):
+        secret = "ghp_016Ap2mQxZ4vB8nK3rT7yU1wE5sD9fG2hJ4k"
+        self.transcript(f"token {secret} here")
+        code, out, _ = self.run_cli(["--discover", "--all", "--json"])
+        payload = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["mode"], "discover")
+        kinds = {f["kind"] for f in payload["findings"]}
+        self.assertIn("github_pat", kinds)
+        for f in payload["findings"]:
+            for key in ("kind", "length", "hits", "files"):
+                self.assertIn(key, f)
+        self.assertNotIn(secret, out, "discover --json must not emit the value")
+
+    def test_json_is_valid_when_clean(self):
+        self.transcript("nothing here")
+        env = self.write("proj/.env", "MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")
+        code, out, _ = self.run_cli(["--from-file", str(env), "--all", "--json"])
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["findings"], [])
+
+
+# ---------------------------------------------------------------------------
+# value input
+# ---------------------------------------------------------------------------
+
+
+class TestValueInput(TestJsonOutput):
+    def test_stdin_values(self):
+        secret = "Kx7vQm2ZpLr9WtBn"
+        self.transcript(f"leaked {secret}")
+        orig = sys.stdin
+        sys.stdin = io.StringIO(secret + "\n")
+        try:
+            code, out, _ = self.run_cli(["--value", "-", "--all"])
+        finally:
+            sys.stdin = orig
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, out)
+
+    def test_stdin_multiple_values_and_blank_lines(self):
+        self.transcript("saw Kx7vQm2ZpLr9WtBn and Zx9KpQm2VnLr7Wtc")
+        orig = sys.stdin
+        sys.stdin = io.StringIO("Kx7vQm2ZpLr9WtBn\n\nZx9KpQm2VnLr7Wtc\n")
+        try:
+            code, out, _ = self.run_cli(["--value", "-", "--all", "--json"])
+        finally:
+            sys.stdin = orig
+        self.assertEqual(len(json.loads(out)["findings"]), 2)
+
+    def test_literal_values_are_deduplicated(self):
+        self.transcript("saw Kx7vQm2ZpLr9WtBn")
+        code, out, _ = self.run_cli(
+            ["--value", "Kx7vQm2ZpLr9WtBn", "--value", "Kx7vQm2ZpLr9WtBn",
+             "--all", "--json"])
+        self.assertEqual(len(json.loads(out)["findings"]), 1)
+
+    def test_extra_path_is_scanned(self):
+        self.transcript("clean")
+        extra = self.write("elsewhere/notes.txt", "leaked Kx7vQm2ZpLr9WtBn\n")
+        code, out, _ = self.run_cli(
+            ["--value", "Kx7vQm2ZpLr9WtBn", "--all", "--path", str(extra), "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn(str(extra), json.loads(out)["findings"][0]["files"])
+
+    def test_missing_path_is_an_error(self):
+        code, _, err = self.run_cli(
+            ["--value", "x", "--path", str(self.root / "nope"), "--all"])
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", err)
+
+    def test_session_scope_selects_one_session(self):
+        proj = self.claude_home / "projects" / "-tmp-proj"
+        (proj / "aaaa-bbbb.jsonl").write_text(
+            json.dumps({"m": "has Kx7vQm2ZpLr9WtBn"}) + "\n")
+        (proj / "cccc-dddd.jsonl").write_text(
+            json.dumps({"m": "has Zx9KpQm2VnLr7Wtc"}) + "\n")
+        code, out, _ = self.run_cli(
+            ["--value", "Zx9KpQm2VnLr7Wtc", "--session", "cccc-dddd", "--json"])
+        self.assertEqual(code, 1)
+        code2, _, _ = self.run_cli(
+            ["--value", "Zx9KpQm2VnLr7Wtc", "--session", "aaaa-bbbb", "--json"])
+        self.assertEqual(code2, 0)
+
+    def test_unknown_session_is_an_error(self):
+        code, _, err = self.run_cli(["--value", "x", "--session", "no-such"])
+        self.assertEqual(code, 2)
+        self.assertIn("no transcript found", err)
+
+
+# ---------------------------------------------------------------------------
+# tuning config
+# ---------------------------------------------------------------------------
+
+
+class TestTuningConfig(TempTree):
+    def setUp(self):
+        super().setUp()
+        self._orig_secret = cr.SECRET_KEY_RE
+        self._orig_benign = cr.BENIGN_KEY_RE
+        self._orig_stop = cr.STOPLIST
+        self.addCleanup(lambda: cr.configure())
+        self.addCleanup(lambda: setattr(cr, "STOPLIST", self._orig_stop))
+
+    def test_configure_extends_never_replaces(self):
+        cr.configure(secret_patterns=["vault"])
+        self.assertTrue(cr.SECRET_KEY_RE.search("MY_VAULT"))
+        self.assertTrue(cr.SECRET_KEY_RE.search("MYSQL_PASSWORD"),
+                        "built-ins must survive extension")
+
+    def test_configure_rejects_a_bad_regex(self):
+        with self.assertRaises(SystemExit):
+            cr.configure(secret_patterns=["(unclosed"])
+
+    def test_configure_extends_stoplist(self):
+        cr.configure(stoplist_values=["MyCorpValue"])
+        self.assertIn("mycorpvalue", cr.STOPLIST)
+
+    def test_config_file_is_read(self):
+        import os
+        cfgdir = self.root / "cfg"
+        (cfgdir / "claude-redact").mkdir(parents=True)
+        (cfgdir / "claude-redact" / cr.CONFIG_FILENAME).write_text(
+            "[keys]\nsecret = vault|kms\nbenign = shard\n"
+            "[values]\nstoplist = mycorp, other\n")
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(cfgdir)
+        try:
+            cfg = cr.load_user_config()
+        finally:
+            if old is None:
+                del os.environ["XDG_CONFIG_HOME"]
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+        self.assertIn("vault|kms", cfg["secret"])
+        self.assertIn("shard", cfg["benign"])
+        self.assertIn("mycorp", cfg["stoplist"])
+
+    def test_malformed_config_is_warned_not_fatal(self):
+        import os
+        cfgdir = self.root / "cfg2"
+        (cfgdir / "claude-redact").mkdir(parents=True)
+        (cfgdir / "claude-redact" / cr.CONFIG_FILENAME).write_text("not ini at all [[[")
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(cfgdir)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                cfg = cr.load_user_config()
+        finally:
+            if old is None:
+                del os.environ["XDG_CONFIG_HOME"]
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+        self.assertEqual(cfg["secret"], [])
+        self.assertIn("malformed", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# robustness
+# ---------------------------------------------------------------------------
+
+
+class TestRobustness(TempTree):
+    def test_empty_config_file_reports_clearly(self):
+        p = self.write("empty.env", "")
+        self.assertEqual(cr.extract_candidates(p), [])
+
+    def test_binary_file_does_not_crash_scanning(self):
+        p = self.root / "blob.bin"
+        p.write_bytes(bytes(range(256)) * 40)
+        counts = cr.count_in_file(p, ["Kx7vQm2ZpLr9WtBn"])
+        self.assertEqual(counts["Kx7vQm2ZpLr9WtBn"], 0)
+
+    def test_unreadable_file_is_skipped_not_fatal(self):
+        p = self.write("locked.jsonl", json.dumps({"m": "x"}) + "\n")
+        p.chmod(0o000)
+        self.addCleanup(lambda: p.chmod(0o644))
+        self.assertEqual(cr.count_in_file(p, ["anything"])["anything"], 0)
+
+    def test_scan_with_no_values_is_harmless(self):
+        p = self.write("a.txt", "content")
+        self.assertEqual(cr.scan([p], []).counts, {})
+
+    def test_human_bytes(self):
+        self.assertEqual(cr.human_bytes(512), "512 B")
+        self.assertEqual(cr.human_bytes(2048), "2.0 KB")
+        self.assertTrue(cr.human_bytes(5 * 1024**2).endswith("MB"))
+        self.assertTrue(cr.human_bytes(3 * 1024**3).endswith("GB"))
+
+    def test_discover_merges_counts_when_deduping(self):
+        """Regression: the dedup merge added zero, losing the other pattern's
+        file counts and understating how widely a value had spread."""
+        secret = "sk-ant-api03-QwErTyUiOpAsDfGhJkLzXcVbNm1234567890"
+        a = self.write("a.txt", secret)
+        b = self.write("b.txt", secret)
+        findings, _ = cr.discover([a, b])
+        match = [f for f in findings if f.kind == "anthropic_key"]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(len(match[0].files), 2)
+        self.assertNotIn(0, match[0].files.values(), "zero-count file entries")
+
+    def test_discovery_listing_declares_what_it_omits(self):
+        """No silent caps: the expanded listing stops at 20 and must say so."""
+        lines = []
+        for i in range(25):
+            lines.append(f"ghp_{'a' * 30}{i:06d}")
+        p = self.write("many.txt", "\n".join(lines))
+        findings, res = cr.discover([p])
+        self.assertGreater(len(findings), 20)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cr.report_discovery(findings, res, 0)
+        self.assertIn("further finding(s) not expanded", out.getvalue())
 
 
 if __name__ == "__main__":

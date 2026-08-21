@@ -26,15 +26,11 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterator, Sequence
 
 __version__ = "0.1.0"
 
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-STATE_DIR = Path(
-    os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
-) / "claude-redact"
-JOURNAL = STATE_DIR / "journal.jsonl"
 
 # Directories under CLAUDE_HOME swept by --all, in rough order of likelihood.
 SWEEP_DIRS = (
@@ -254,7 +250,6 @@ class Candidate:
     files: int = 0            # distinct files containing it
     verdict: str = "skip"     # redact | review | skip
     reason: str = ""
-    selected: bool = False
 
     @property
     def label(self) -> str:
@@ -555,8 +550,13 @@ def _quoted_strings(text: str) -> list[tuple[str, str]]:
     return out
 
 
-def extract_candidates(path: Path, min_length: int) -> list[Candidate]:
-    """Every plausible secret in a config file, over-inclusive by design."""
+def extract_candidates(path: Path) -> list[Candidate]:
+    """Every plausible secret in a config file, over-inclusive by design.
+
+    Deliberately takes no length floor: extraction must stay broad so that
+    --key-pattern can widen detection and composite decomposition can reach
+    inside values. The floor belongs to Candidate.classify.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -1185,23 +1185,12 @@ def discover(targets: Sequence[Path]) -> tuple[list[Finding], ScanResult]:
         if prev is None or rank[f.kind] < rank[prev.kind]:
             if prev is not None:
                 for path_str, n in prev.files.items():
-                    f.files[path_str] = f.files.get(path_str, 0) + 0
+                    f.files[path_str] = f.files.get(path_str, 0) + n
             by_value[f.sample] = f
 
     findings = sorted(by_value.values(), key=lambda f: (f.kind, -f.hits))
     return findings, res
 
-
-def _jsonl_strings(raw: str) -> Iterator[str]:
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            doc = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            yield line
-            continue
-        yield from _strings_in(doc)
 
 
 def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) -> None:
@@ -1220,7 +1209,8 @@ def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) 
         )
 
     print()
-    for f in findings[:20]:
+    listed = findings[:20]
+    for f in listed:
         print(f"  {f.kind}:")
         for path, n in sorted(f.files.items(), key=lambda kv: -kv[1])[:5]:
             p = Path(path)
@@ -1231,6 +1221,12 @@ def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) 
             print(f"    {shown}  ({n})")
         if len(f.files) > 5:
             print(f"    ... and {len(f.files) - 5} more file(s)")
+
+    if len(findings) > len(listed):
+        print(
+            f"  ... {len(findings) - len(listed)} further finding(s) not "
+            "expanded above; all are counted in the table"
+        )
 
     print()
     print(_c("1;31", f"{len(findings)} distinct credential-shaped value(s) found"))
@@ -1244,7 +1240,7 @@ def report_discovery(findings: Sequence[Finding], res: ScanResult, prefix: int) 
 def human_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n / 1:.1f} {unit}"
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} GB"
 
@@ -1252,7 +1248,6 @@ def human_bytes(n: int) -> str:
 def report(
     cands: Sequence[Candidate],
     res: ScanResult,
-    targets: Sequence[Path],
     show_prefix: int,
     verbose: bool = False,
 ) -> None:
@@ -1554,7 +1549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cands = []
         seen_values: set[str] = set()
         for src in sources:
-            for c in extract_candidates(src, args.min_length):
+            for c in extract_candidates(src):
                 if c.value not in seen_values:
                     seen_values.add(c.value)
                     cands.append(c)
@@ -1612,7 +1607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     else:
-        report(cands, res, targets, args.show_prefix, args.verbose)
+        report(cands, res, args.show_prefix, args.verbose)
 
     # Exit non-zero only for something worth a human's attention. "A value from
     # the config appears somewhere" is true of PUID=1000 on every host, so using
