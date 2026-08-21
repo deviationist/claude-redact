@@ -309,14 +309,13 @@ class Candidate:
             bool(BENIGN_KEY_RE.search(leaf)) or bool(BENIGN_SUBTREE_RE.search(self.key))
         )
 
-        # A credential key name lowers the length floor - short passwords are
-        # real - but a very short value still causes the worst collateral damage.
-        floor = 4 if credential_key else min_length
-        if len(v) < floor:
-            self.verdict, self.reason = "skip", f"under {floor} chars"
+        # --- 1. the key name says "credential" -------------------------------
+        # The floor is lower here - short passwords are real - but a very short
+        # value still causes the worst collateral damage when replaced.
+        if credential_key and len(v) < 4:
+            self.verdict, self.reason = "skip", "under 4 chars"
             return
 
-        # --- 1. the key name says "credential" -------------------------------
         if credential_key:
             if self.hits > 100 and self.files > 10:
                 self.verdict, self.reason = (
@@ -328,11 +327,17 @@ class Candidate:
             return
 
         # --- 2. the key name says "not a credential" -------------------------
+        # Checked before the length floor so the reported reason is the truthful
+        # one: a short image reference is benign because of its key, not because
+        # it happens to be under the floor.
         if benign_key:
             self.verdict, self.reason = "skip", "benign key name"
             return
 
         # --- 3. the key name says nothing: fall back to value signals --------
+        if len(v) < min_length:
+            self.verdict, self.reason = "skip", f"under {min_length} chars"
+            return
         # Occurrence count first. It is measured from the user's real files
         # rather than guessed from the value, so it catches low-entropy secrets
         # and, more usefully, stops common words being treated as credentials.

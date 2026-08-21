@@ -132,6 +132,23 @@ class TestClassification(unittest.TestCase):
         c.classify(8)
         self.assertEqual(c.verdict, "redact")
 
+    def test_skip_reason_names_the_real_cause(self):
+        """A short benign value should say so, not blame the length floor."""
+        c = self.classify("services.app.image", "alpine", hits=121)
+        self.assertEqual(c.verdict, "skip")
+        self.assertEqual(c.reason, "benign key name")
+
+    def test_command_values_are_still_extracted_for_decomposition(self):
+        """`command` is benign by name, but a credential passed on a command
+        line must still be recovered from inside it."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "docker-compose.yml"
+            p.write_text("services:\n  app:\n    command: run --dsn "
+                         "mysql://svc:Kx7vQm2ZpLr9WtBn@db/app\n")
+            values = {c.value for c in cr.extract_candidates(p, 8)}
+        self.assertIn("Kx7vQm2ZpLr9WtBn", values)
+
     def test_cloud_resource_names_are_benign(self):
         for key in ("R2_BUCKET", "BACKUP_R2_BUCKET", "AWS_REGION", "GCP_PROJECT_ID"):
             with self.subTest(key=key):
