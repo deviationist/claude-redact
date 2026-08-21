@@ -1600,7 +1600,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "reason": c.reason,
                         }
                         for c in cands
-                        if c.hits > 0
+                        # Same filter as the text report and the exit code: a
+                        # benign candidate that merely appears is not a finding,
+                        # and a consumer checking len(findings) must agree with
+                        # the exit status. --verbose includes them.
+                        if c.hits > 0 and (args.verbose or c.verdict != "skip")
                     ],
                 },
                 indent=2,

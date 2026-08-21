@@ -130,6 +130,15 @@ file-history/<uuid>/*                         pre-edit copies of files that were
 inline, so a sizeable `cat .env` can land in a file the transcript only points
 at. Scanning the `.jsonl` alone would report the session clean.
 
+`--all` also reaches two places that are easy to forget and that a
+session-scoped run will not touch:
+
+- `projects/<slug>/memory/*.md` — persistent memory files, which are loaded into
+  context at the start of every session in that project. A credential written
+  into one is re-read indefinitely.
+- `file-history/<uuid>/` — pre-edit snapshots of files an agent modified. Editing
+  a `.env` leaves a complete copy of its previous contents here.
+
 `--all` is the honest choice when you do not know which session leaked.
 
 ## How values are judged

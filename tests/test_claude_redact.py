@@ -885,6 +885,25 @@ class TestJsonOutput(TempTree):
                 self.assertIn(key, f)
         self.assertNotIn(secret, out, "discover --json must not emit the value")
 
+    def test_json_findings_agree_with_exit_code(self):
+        """A benign candidate that merely appears is not a finding; len(findings)
+        must not contradict the exit status."""
+        self.transcript("PUID=1000 and TZ=Europe/Oslo are here")
+        env = self.write("proj/.env", "PUID=1000\nTZ=Europe/Oslo\n")
+        code, out, _ = self.run_cli(["--from-file", str(env), "--all", "--json"])
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["findings"], [])
+
+    def test_json_verbose_includes_benign(self):
+        self.transcript("PUID=1000 is here")
+        env = self.write("proj/.env", "PUID=1000\n")
+        _, out, _ = self.run_cli(
+            ["--from-file", str(env), "--all", "--json", "--verbose"])
+        payload = json.loads(out)
+        self.assertTrue(payload["findings"])
+        self.assertEqual(payload["findings"][0]["verdict"], "skip")
+
     def test_json_is_valid_when_clean(self):
         self.transcript("nothing here")
         env = self.write("proj/.env", "MYSQL_PASSWORD=Kx7vQm2ZpLr9WtBn\n")
