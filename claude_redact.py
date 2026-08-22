@@ -2063,12 +2063,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     targets = resolve_targets(args)
     if not targets:
         die("no files to scan")
-    active = [t for t in targets if t.suffix == ".jsonl" and is_active(t)]
-    if active:
-        warn(
-            f"{active[0].name} was modified in the last two minutes and is "
-            "probably a live session"
-        )
+    # Only warn here for a read-only run. Under --redact the plan does its own
+    # check against the files actually being rewritten, and warning about an
+    # unrelated live session reads as "you are about to redact a live session"
+    # when that session is not in the plan at all.
+    if not args.redact:
+        active = [t for t in targets if t.suffix == ".jsonl" and is_active(t)]
+        if active:
+            warn(
+                f"{active[0].name} was modified in the last two minutes and is "
+                "probably a live session"
+            )
 
     # 3. scan, then classify using the measured hit counts
     res = scan(targets, [c.value for c in cands])

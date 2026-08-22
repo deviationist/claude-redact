@@ -1733,6 +1733,25 @@ class TestRedactCLI(TempTree):
         self.assertIn("live session", err)
         self.assertEqual(t.read_bytes(), before)
 
+    def test_unrelated_live_session_does_not_warn_during_redact(self):
+        """Regression: the scan-phase warning named a live session that was not
+        in the plan, reading as a warning about the redaction itself."""
+        self.transcript(f"leaked {SECRET} here", name="aaaa-bbbb.jsonl")
+        self.transcript("something unrelated", name="live-one.jsonl", age=0)
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("live session", err)
+
+    def test_live_target_still_warns_during_redact(self):
+        self.transcript(f"leaked {SECRET} here", age=0)
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 2)
+        self.assertIn("live session", err)
+
     def test_force_redacts_a_live_session(self):
         t = self.transcript(f"leaked {SECRET} here", age=0)
         env = self.envfile()
