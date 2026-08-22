@@ -98,6 +98,36 @@ a prompt once. Deliberately shape-based rather than entropy-based: transcripts
 are full of git SHAs, UUIDs, base64 and minified code, and an entropy threshold
 buries real findings in noise.
 
+## Keeping a value out in the first place
+
+```bash
+ssh host 'cat /srv/app/.env' | claude-redact --filter
+docker compose config          | claude-redact --filter
+```
+
+`--filter` reads stdin and writes the same text to stdout with credentials
+replaced. Nothing is scanned and nothing touches disk — it is the mirror image
+of `--redact`, which cleans files after a leak.
+
+Key names are preserved on purpose:
+
+```
+MYSQL_ROOT_PASSWORD=[REDACTED:MYSQL_ROOT_PASSWORD]
+DATABASE_URL=postgres://svc:[REDACTED:URL_CREDENTIALS]@db.internal/app
+TZ=Europe/Oslo
+```
+
+An agent reading that knows the key exists and what it is called, which is
+enough to write a command that dereferences it remotely — so blocking the value
+costs nothing on the large majority of tasks. Detection is shape-based, since a
+stream has no reference file; `--from-file` adds known values on top.
+
+The summary goes to stderr, so stdout stays a clean pipe.
+
+**Caveat:** a pipe discards the upstream exit code unless `pipefail` is set. Fine
+when you type it yourself; something to be deliberate about before wiring it into
+anything automatic.
+
 ## Removing what you find
 
 ```bash

@@ -9,7 +9,7 @@ and removes them. Scanning is the default; `--redact` is the destructive path.
 |---|---|
 | `claude-redact` | Executable shim. Wires argv to `main()`, nothing else. |
 | `claude_redact.py` | All logic. Kept importable so the tests can reach it — this is why the shim exists. |
-| `tests/test_claude_redact.py` | 194 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
+| `tests/test_claude_redact.py` | 210 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
 
 No dependencies, and it should stay that way. PyYAML is used **if importable**
 and otherwise falls through to the line scanner — never add it as a requirement.
@@ -206,6 +206,30 @@ inferred from documentation.
   terminal.
 - Compose `environment` may be a YAML list, giving `PUID=1000` as one opaque
   value with the key name lost. `ENV_ASSIGN_RE` splits those back into pairs.
+
+## Filter mode
+
+`filter_stream` is prevention, `redact_file` is remediation - stream in flight
+versus files on disk. The filter reuses `_DISCOVERY_COMPILED` and every noise
+filter, so precision fixes benefit both.
+
+Two details that are easy to undo by accident:
+
+- **Longest match first.** A password nested inside a URL must be replaced
+  before the outer match, or the outer one leaves a half-redacted remnant.
+- **The key name is recovered by walking backwards** from the match. The
+  `password_assignment` pattern has no key-name prefix (it cost 13x in
+  backtracking), so the label is reconstructed from the preceding word
+  characters. `[REDACTED:MYSQL_PASSWORD]` is worth far more to a reader than
+  `[REDACTED:PASSWORD_ASSIGNMENT]`.
+
+The summary goes to **stderr**; stdout must stay a clean pipe.
+
+Hooks cannot help with Bash output. Verified against the binary rather than
+inferred: `PreToolUse` carries `updatedInput` and `permissionDecision`,
+`PostToolUse` only feeds a `reason` back after the result exists, and no field
+for rewriting a tool result exists anywhere. That is why prevention is
+structurally partial and the scanner is the half with no blind spots.
 
 ## Redaction invariants
 

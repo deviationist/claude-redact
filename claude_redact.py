@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 
@@ -1583,6 +1583,96 @@ def verify_removed(
 
 
 # ---------------------------------------------------------------------------
+# filter mode
+# ---------------------------------------------------------------------------
+#
+# Text in on stdin, the same text out on stdout with credentials replaced. The
+# mirror image of --redact: that one cleans files after a leak, this one stops
+# the value reaching an agent at all.
+#
+#     ssh host 'cat /srv/app/.env' | claude-redact --filter
+#
+# Key names are preserved deliberately. Seeing MYSQL_PASSWORD=[REDACTED:...] is
+# enough to write a command that dereferences the value remotely, so blocking
+# the value costs the reader nothing on the large majority of tasks.
+#
+# Detection is shape-based by default because a stream has no reference file;
+# --from-file adds known values on top when the caller does know.
+
+
+def filter_stream(
+    text: str, extra: Sequence[Replacement] = ()
+) -> tuple[str, dict[str, int]]:
+    """Redact credential shapes (and any extra known values) in a blob of text."""
+    counts: dict[str, int] = {}
+
+    if extra:
+        text, c = _replace_in_text(text, extra)
+        counts.update(c)
+
+    # Longest first, so a nested match (a password inside a URL) does not leave
+    # a half-redacted outer match behind.
+    found: list[tuple[str, str, str]] = []
+    for kind, rx in _DISCOVERY_COMPILED:
+        needs_boundary = kind in BOUNDARY_KINDS
+        for m in rx.finditer(text):
+            if needs_boundary and m.start() > 0 and text[m.start() - 1] in _WORD_CHARS:
+                continue
+            label = kind.upper()
+            if kind == "password_assignment":
+                value = m.group("pw_value")
+                # The pattern deliberately has no key-name prefix (it cost 13x
+                # in backtracking), so walk back over the key characters to
+                # recover it: [REDACTED:MYSQL_PASSWORD] tells the reader far
+                # more than [REDACTED:PASSWORD_ASSIGNMENT].
+                j = m.start()
+                while j > 0 and (text[j - 1] in _WORD_CHARS or text[j - 1] == "."):
+                    j -= 1
+                key = re.split(r"[:=]", text[j:m.end()], 1)[0].strip()
+                if key:
+                    label = re.sub(r"[^A-Za-z0-9_.\-]", "_", key)[:48].upper()
+            elif kind == "url_credentials":
+                value = m.group("url_pw")
+            else:
+                value = m.group(0)
+            if not value or PLACEHOLDER_RE.search(value):
+                continue
+            if kind in LOW_PRECISION_KINDS and (
+                value.lower() in CODE_KEYWORDS
+                or value.lower() in STOPLIST
+                or CODE_SHAPE_RE.search(value)
+                or CODE_REF_RE.match(value)
+                or looks_structural(value)
+            ):
+                continue
+            found.append((kind, value, label))
+
+    for kind, value, label in sorted(set(found), key=lambda kv: -len(kv[1])):
+        if value not in text:
+            continue
+        n = text.count(value)
+        text = text.replace(value, f"[REDACTED:{label}]")
+        counts[kind] = counts.get(kind, 0) + n
+
+    return text, counts
+
+
+def run_filter(args: argparse.Namespace, extra: Sequence[Replacement] = ()) -> int:
+    """Read stdin, write redacted stdout. Never touches disk."""
+    data = sys.stdin.buffer.read()
+    text = data.decode("utf-8", errors="surrogateescape")
+    out, counts = filter_stream(text, extra)
+    sys.stdout.buffer.write(out.encode("utf-8", errors="surrogateescape"))
+    sys.stdout.buffer.flush()
+    if counts:
+        total = sum(counts.values())
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        # stderr, so stdout stays a clean pipe.
+        info(f"claude-redact: redacted {total} value(s) [{summary}]")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
 
@@ -1790,6 +1880,14 @@ def build_parser() -> argparse.ArgumentParser:
         "Destructive and irreversible - there is no undo store, by design.",
     )
     act.add_argument(
+        "--filter",
+        action="store_true",
+        help="read stdin, write it to stdout with credentials replaced. Nothing "
+        "is scanned and nothing is written to disk - use it to keep a value out "
+        "of an agent's context in the first place: "
+        "`ssh host 'cat .env' | claude-redact --filter`",
+    )
+    act.add_argument(
         "--dry-run",
         action="store_true",
         help="with --redact: show exactly what would change, write nothing",
@@ -1973,6 +2071,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         benign_patterns=cfg["benign"] + (args.benign_pattern or []),
         stoplist_values=cfg["stoplist"] + (args.stop_value or []),
     )
+
+    if args.filter:
+        extra: list[Replacement] = []
+        for entry in args.from_file or []:
+            src = Path(entry).expanduser()
+            if not src.is_file():
+                die(f"not a file: {src}")
+            for c in extract_candidates(src):
+                c.hits = 1  # present by assumption: the caller named the file
+                c.classify(args.min_length)
+                if c.verdict == "redact" or (args.include_review and c.verdict == "review"):
+                    extra.append(Replacement(c.value, c.placeholder, c.label))
+        return run_filter(args, extra)
 
     if not any((args.from_file, args.from_dir, args.value, args.discover)):
         # The overwhelmingly common intent is "audit this project's configs".

@@ -1840,5 +1840,95 @@ class TestRedactCLI(TempTree):
         self.assertNotIn(SECRET, snap.read_text())
 
 
+class TestFilterMode(TempTree):
+    """Streaming redaction: stdin -> stdout, nothing touches disk."""
+
+    def filt(self, text, extra=()):
+        return cr.filter_stream(text, extra)[0]
+
+    def test_credential_shapes_are_redacted(self):
+        out = self.filt("token=ghp_016Ap2mQxZ4vB8nK3rT7yU1wE5sD9fG2hJ4k\n")
+        self.assertNotIn("ghp_016Ap2mQxZ4vB8nK3rT7yU1wE5sD9fG2hJ4k", out)
+        self.assertIn("[REDACTED:", out)
+
+    def test_key_names_are_preserved(self):
+        """The reader must still be able to dereference the value remotely."""
+        out = self.filt(f"MYSQL_ROOT_PASSWORD={SECRET}\n")
+        self.assertIn("MYSQL_ROOT_PASSWORD=", out)
+        self.assertNotIn(SECRET, out)
+
+    def test_placeholder_carries_the_key_name(self):
+        out = self.filt(f"SLSKD_SLSK_PASSWORD={SECRET}\n")
+        self.assertIn("[REDACTED:SLSKD_SLSK_PASSWORD]", out)
+
+    def test_benign_lines_pass_through_untouched(self):
+        text = "TZ=Europe/Oslo\nPUID=1000\nrestart: unless-stopped\n"
+        self.assertEqual(self.filt(text), text)
+
+    def test_url_keeps_structure_and_loses_only_the_password(self):
+        out = self.filt("DATABASE_URL=postgres://svc:Tr0ub4dor3xKq@db.internal/app\n")
+        self.assertIn("postgres://svc:", out)
+        self.assertIn("@db.internal/app", out)
+        self.assertNotIn("Tr0ub4dor3xKq", out)
+
+    def test_placeholders_are_not_re_redacted(self):
+        text = "API_KEY=your-api-key-here\nSECRET=${VAULT_TOKEN}\n"
+        self.assertEqual(self.filt(text), text)
+
+    def test_known_values_can_be_added(self):
+        rep = cr.Replacement("lowentropyvalue", "[REDACTED:K]", "K")
+        out = self.filt("thing=lowentropyvalue\n", [rep])
+        self.assertIn("[REDACTED:K]", out)
+        self.assertNotIn("lowentropyvalue", out)
+
+    def test_nested_match_is_fully_removed(self):
+        """A password inside a URL must not leave a half-redacted outer match."""
+        out = self.filt("u=postgres://a:Tr0ub4dor3xKq@h/db\n")
+        self.assertNotIn("Tr0ub4dor3xKq", out)
+
+    def test_source_code_is_not_mangled(self):
+        code = "const token = generateAccessToken(user)\napi_key: process.env.OPENAI_KEY\n"
+        self.assertEqual(self.filt(code), code)
+
+    def test_multiline_pem_block_detected(self):
+        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n"
+        self.assertIn("[REDACTED:", self.filt(text))
+
+    def test_empty_input(self):
+        self.assertEqual(self.filt(""), "")
+
+    def test_cli_filter_reads_stdin_writes_stdout(self):
+        import subprocess
+        exe = Path(__file__).resolve().parent.parent / "claude-redact"
+        proc = subprocess.run(
+            [sys.executable, str(exe), "--filter"],
+            input=f"MYSQL_PASSWORD={SECRET}\n".encode(),
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn(SECRET.encode(), proc.stdout)
+        self.assertIn(b"MYSQL_PASSWORD=", proc.stdout)
+        self.assertIn(b"redacted", proc.stderr, "summary belongs on stderr")
+
+    def test_cli_filter_keeps_stdout_clean_for_piping(self):
+        import subprocess
+        exe = Path(__file__).resolve().parent.parent / "claude-redact"
+        proc = subprocess.run(
+            [sys.executable, str(exe), "--filter"],
+            input=b"TZ=Europe/Oslo\n", capture_output=True)
+        self.assertEqual(proc.stdout, b"TZ=Europe/Oslo\n",
+                         "stdout must be the stream and nothing else")
+
+    def test_undecodable_bytes_survive(self):
+        import subprocess
+        exe = Path(__file__).resolve().parent.parent / "claude-redact"
+        proc = subprocess.run(
+            [sys.executable, str(exe), "--filter"],
+            input=b"\xff\xfe head " + SECRET.encode() + b" tail",
+            capture_output=True)
+        self.assertTrue(proc.stdout.startswith(b"\xff\xfe"))
+        self.assertTrue(proc.stdout.endswith(b"tail"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
