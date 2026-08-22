@@ -49,6 +49,17 @@ class TempTree(unittest.TestCase):
 
         self.addCleanup(restore)
 
+        # Liveness is probed from the real process table, so pin it: otherwise
+        # the suite passes or fails depending on whether the developer happens
+        # to have Claude Code running. Tests opt in with self.live_dirs().
+        prev_cache = cr._LIVE_DIRS_CACHE
+        cr._LIVE_DIRS_CACHE = set()
+        self.addCleanup(lambda: setattr(cr, "_LIVE_DIRS_CACHE", prev_cache))
+
+    def live_dirs(self, dirs):
+        """Pin which project dirs have a running session. None = cannot tell."""
+        cr._LIVE_DIRS_CACHE = dirs
+
     def write(self, relpath: str, content: str) -> Path:
         p = self.root / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1725,6 +1736,7 @@ class TestRedactCLI(TempTree):
 
     def test_live_session_is_refused_without_force(self):
         t = self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs({"-tmp-proj"})
         before = t.read_bytes()
         env = self.envfile()
         code, _, err = self.run_cli(
@@ -1733,11 +1745,89 @@ class TestRedactCLI(TempTree):
         self.assertIn("live session", err)
         self.assertEqual(t.read_bytes(), before)
 
+    def test_fresh_mtime_without_a_running_session_is_not_refused(self):
+        """The regression this change is about: every session that exits used to
+        be unredactable for two minutes - exactly the window you are in, since
+        noticing a leak is usually why you just quit."""
+        t = self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs(set())          # nothing running anywhere
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(SECRET, t.read_text())
+
+    def test_old_mtime_with_a_running_session_is_refused(self):
+        """mtime says dead, the process table says otherwise. Trust the process."""
+        self.transcript(f"leaked {SECRET} here", age=99999)
+        self.live_dirs({"-tmp-proj"})
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 2)
+        self.assertIn("live session", err)
+
+    def test_unknown_probe_falls_back_to_the_mtime_window(self):
+        """Unknown must never collapse into 'nothing is live'."""
+        t = self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs(None)
+        before = t.read_bytes()
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 2)
+        self.assertIn("live session", err)
+        self.assertEqual(t.read_bytes(), before)
+
+    def test_unknown_probe_allows_an_old_transcript(self):
+        t = self.transcript(f"leaked {SECRET} here", age=99999)
+        self.live_dirs(None)
+        env = self.envfile()
+        code, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(SECRET, t.read_text())
+
+    def test_session_id_match_is_refused_even_when_nothing_looks_live(self):
+        import os
+        t = self.transcript(f"leaked {SECRET} here", age=99999)
+        self.live_dirs(set())
+        old = os.environ.get("CLAUDE_SESSION_ID")
+        os.environ["CLAUDE_SESSION_ID"] = "aaaa-bbbb"
+        try:
+            env = self.envfile()
+            code, _, err = self.run_cli(
+                ["--from-file", str(env), "--all", "--redact", "--yes"])
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_SESSION_ID"] = old
+        self.assertEqual(code, 2)
+        self.assertIn("live session", err)
+
+    def test_error_message_says_why_it_looks_live(self):
+        self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs({"-tmp-proj"})
+        env = self.envfile()
+        _, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertIn("session is running in", err)
+
+    def test_error_message_gives_a_countdown_when_probe_is_unknown(self):
+        self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs(None)
+        env = self.envfile()
+        _, _, err = self.run_cli(
+            ["--from-file", str(env), "--all", "--redact", "--yes"])
+        self.assertIn("stops looking live in", err)
+
     def test_unrelated_live_session_does_not_warn_during_redact(self):
         """Regression: the scan-phase warning named a live session that was not
         in the plan, reading as a warning about the redaction itself."""
         self.transcript(f"leaked {SECRET} here", name="aaaa-bbbb.jsonl")
         self.transcript("something unrelated", name="live-one.jsonl", age=0)
+        self.live_dirs(set())
         env = self.envfile()
         code, _, err = self.run_cli(
             ["--from-file", str(env), "--all", "--redact", "--yes"])
@@ -1746,6 +1836,7 @@ class TestRedactCLI(TempTree):
 
     def test_live_target_still_warns_during_redact(self):
         self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs({"-tmp-proj"})
         env = self.envfile()
         code, _, err = self.run_cli(
             ["--from-file", str(env), "--all", "--redact", "--yes"])
@@ -1754,6 +1845,7 @@ class TestRedactCLI(TempTree):
 
     def test_force_redacts_a_live_session(self):
         t = self.transcript(f"leaked {SECRET} here", age=0)
+        self.live_dirs({"-tmp-proj"})
         env = self.envfile()
         code, _, _ = self.run_cli(
             ["--from-file", str(env), "--all", "--redact", "--yes", "--force"])
@@ -1928,6 +2020,88 @@ class TestFilterMode(TempTree):
             capture_output=True)
         self.assertTrue(proc.stdout.startswith(b"\xff\xfe"))
         self.assertTrue(proc.stdout.endswith(b"tail"))
+
+
+class TestLivenessProbe(TempTree):
+    """The three-state probe. Unknown must never become 'nothing is live'."""
+
+    def setUp(self):
+        super().setUp()
+        cr._LIVE_DIRS_CACHE = cr._UNPROBED
+
+    def test_probe_returns_a_set_or_none_only(self):
+        got = cr.live_project_dirs(refresh=True)
+        self.assertTrue(got is None or isinstance(got, set))
+
+    def test_real_probe_agrees_with_encode_cwd(self):
+        """Any dir it reports must be a slug, not a raw path."""
+        got = cr.live_project_dirs(refresh=True)
+        if got is None:
+            self.skipTest("process table not visible here")
+        for slug in got:
+            self.assertNotIn("/", slug, "slug should be encoded, not a path")
+
+    def test_result_is_cached(self):
+        first = cr.live_project_dirs(refresh=True)
+        cr._LIVE_DIRS_CACHE = {"-sentinel"}
+        self.assertEqual(cr.live_project_dirs(), {"-sentinel"})
+        self.assertIsNot(first, object())
+
+    def test_unknown_pids_yield_unknown_dirs(self):
+        orig = cr._claude_pids
+        cr._claude_pids = lambda: None
+        try:
+            self.assertIsNone(cr.live_project_dirs(refresh=True))
+        finally:
+            cr._claude_pids = orig
+
+    def test_unknown_cwds_yield_unknown_dirs(self):
+        o1, o2 = cr._claude_pids, cr._cwds_of
+        cr._claude_pids = lambda: [1234]
+        cr._cwds_of = lambda pids: None
+        try:
+            self.assertIsNone(cr.live_project_dirs(refresh=True))
+        finally:
+            cr._claude_pids, cr._cwds_of = o1, o2
+
+    def test_no_running_sessions_is_a_real_answer(self):
+        o1, o2 = cr._claude_pids, cr._cwds_of
+        cr._claude_pids = lambda: []
+        cr._cwds_of = lambda pids: []
+        try:
+            self.assertEqual(cr.live_project_dirs(refresh=True), set())
+        finally:
+            cr._claude_pids, cr._cwds_of = o1, o2
+
+    def test_cwds_are_encoded_to_slugs(self):
+        o1, o2 = cr._claude_pids, cr._cwds_of
+        cr._claude_pids = lambda: [1]
+        cr._cwds_of = lambda pids: ["/Users/bob/.zsh"]
+        try:
+            self.assertEqual(cr.live_project_dirs(refresh=True), {"-Users-bob--zsh"})
+        finally:
+            cr._claude_pids, cr._cwds_of = o1, o2
+
+    def test_is_active_prefers_session_id_over_everything(self):
+        import os
+        cr._LIVE_DIRS_CACHE = set()
+        t = self.write("projects/-x/abc.jsonl", "{}")
+        old = os.environ.get("CLAUDE_SESSION_ID")
+        os.environ["CLAUDE_SESSION_ID"] = "abc"
+        try:
+            self.assertTrue(cr.is_active(t))
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_SESSION_ID"] = old
+
+    def test_liveness_reason_wording(self):
+        t = self.write("projects/-x/abc.jsonl", "{}")
+        cr._LIVE_DIRS_CACHE = {"-x"}
+        self.assertIn("session is running in", cr.liveness_reason(t))
+        cr._LIVE_DIRS_CACHE = None
+        self.assertIn("stops looking live in", cr.liveness_reason(t))
 
 
 if __name__ == "__main__":

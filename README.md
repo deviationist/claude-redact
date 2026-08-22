@@ -156,8 +156,13 @@ Guarantees, each covered by tests:
   characters JSON escapes and a raw search cannot find it.
 - **Undecodable bytes round-trip** unchanged.
 - **A live session is refused** unless `--force`. Its context still holds the
-  value and can write it back, so redacting it is best-effort at best — exit
-  the session first.
+  value and can write it back, so redacting it is best-effort at best — exit the
+  session first. Liveness is detected by looking for a running Claude Code
+  process whose working directory is the transcript's project, falling back to
+  file age only when the process table cannot be read. That matters because
+  Claude Code does not hold transcripts open, so age alone cannot tell "being
+  written" from "written a moment ago and exited" — and the moment you most want
+  to clean a session is right after quitting it.
 - **Non-interactive runs refuse** without `--yes`.
 - **A verify pass re-scans everything afterwards** — the whole of each config
   dir, not just the files that were rewritten — and reports anything still

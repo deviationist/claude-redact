@@ -831,19 +831,161 @@ def session_targets(transcript: Path, root: Path | None = None) -> list[Path]:
     return out
 
 
-def is_active(path: Path, window: float = 120.0) -> bool:
-    """Heuristic: a transcript touched moments ago is probably a live session.
+LIVENESS_PROBE_TIMEOUT = 5.0
+_LIVE_DIRS_CACHE: "set[str] | None | object" = None  # set to _UNPROBED below
+_UNPROBED = object()
+_LIVE_DIRS_CACHE = _UNPROBED
 
-    Rewriting a file Claude Code holds open for append is the one operation
-    here that can lose data, so this errs towards claiming 'active'.
+
+def _claude_pids() -> "list[int] | None":
+    """Pids of running Claude Code processes. None when unknowable."""
+    import subprocess
+
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        pids = []
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError:
+            return None
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                if (entry / "comm").read_text(errors="replace").strip() == "claude":
+                    pids.append(int(entry.name))
+            except OSError:
+                continue  # racing process, or another user's - both normal
+        return pids
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,comm="],
+            capture_output=True, text=True,
+            timeout=LIVENESS_PROBE_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        # An empty process table is not a real answer - it means the probe
+        # could not see anything, e.g. inside a restricted sandbox.
+        return None
+    pids = []
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip().rsplit("/", 1)[-1] == "claude":
+            try:
+                pids.append(int(parts[0]))
+            except ValueError:
+                continue
+    return pids
+
+
+def _cwds_of(pids: Sequence[int]) -> "list[str] | None":
+    """Working directories of the given pids. None when unknowable."""
+    import subprocess
+
+    if not pids:
+        return []
+    if Path("/proc").is_dir():
+        out = []
+        for pid in pids:
+            try:
+                out.append(os.readlink(f"/proc/{pid}/cwd"))
+            except OSError:
+                continue
+        return out
+    try:
+        # One batched call. Spawning lsof per pid would cost more than the work.
+        res = subprocess.run(
+            ["/usr/sbin/lsof", "-a", "-p", ",".join(str(p) for p in pids),
+             "-d", "cwd", "-Fn"],
+            capture_output=True, text=True,
+            timeout=LIVENESS_PROBE_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # lsof exits non-zero when it finds nothing, which is a normal answer.
+    return [ln[1:] for ln in res.stdout.splitlines() if ln.startswith("n")]
+
+
+def live_project_dirs(refresh: bool = False) -> "set[str] | None":
+    """Project-dir slugs that currently have a Claude Code session running.
+
+    A session's process cwd encodes to its transcript's project dir, so a
+    running `claude` in that directory means transcripts there may still be
+    written. Verified on a live machine: every running session's cwd mapped to
+    an existing projects/<slug>.
+
+    Returns None for "cannot tell" - never an empty set standing in for it.
+    The caller falls back to the mtime window on None, so collapsing unknown
+    into "nothing live" is the one change that would make this less safe.
+
+    Not per-session precise: two sessions in one directory cannot be told
+    apart, so every transcript in that dir reads as active. That is the safe
+    direction.
+    """
+    global _LIVE_DIRS_CACHE
+    if not refresh and _LIVE_DIRS_CACHE is not _UNPROBED:
+        return _LIVE_DIRS_CACHE  # type: ignore[return-value]
+
+    result: "set[str] | None"
+    pids = _claude_pids()
+    if pids is None:
+        result = None
+    else:
+        cwds = _cwds_of(pids)
+        result = None if cwds is None else {encode_cwd(Path(c)) for c in cwds if c}
+    _LIVE_DIRS_CACHE = result
+    return result
+
+
+def is_active(path: Path, window: float = 120.0) -> bool:
+    """Is this transcript one a running session may still write to?
+
+    Precedence:
+      1. $CLAUDE_SESSION_ID names it            -> active (exact)
+      2. a session is running in its project dir -> active
+      3. the probe cannot tell                   -> fall back to the mtime window
+      4. no session in its project dir           -> not active, whatever the mtime
+
+    Rule 4 is the point. Claude Code does NOT hold transcripts open - measured:
+    a live session's process had 32 fds and none were .jsonl, and no transcript
+    anywhere on the machine was held. So mtime alone cannot distinguish "being
+    written" from "written a moment ago and exited", and every session that quits
+    used to be unredactable for two minutes - precisely the window you are in,
+    since noticing a leak is usually why you just quit.
+
+    The asymmetry is deliberate throughout: a false "not active" can corrupt a
+    live transcript, a false "active" costs one --force.
     """
     env_session = os.environ.get("CLAUDE_SESSION_ID")
     if env_session and path.stem == env_session:
         return True
+
+    live = live_project_dirs()
+    if live is not None:
+        return path.parent.name in live
+
     try:
         return (time.time() - path.stat().st_mtime) < window
     except OSError:
         return False
+
+
+def liveness_reason(path: Path, window: float = 120.0) -> str:
+    """Why `path` reads as live, in words the user can act on."""
+    if os.environ.get("CLAUDE_SESSION_ID") == path.stem:
+        return "it is the session you are running from"
+    if live_project_dirs() is not None:
+        return f"a Claude Code session is running in {path.parent.name}"
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return "unknown"
+    return (
+        f"it was written {age:.0f}s ago and this machine cannot tell whether a "
+        f"session is running; it stops looking live in {max(0, window - age):.0f}s"
+    )
 
 
 def iter_files(root: Path) -> Iterator[Path]:
@@ -1905,8 +2047,11 @@ def build_parser() -> argparse.ArgumentParser:
     act.add_argument(
         "--force",
         action="store_true",
-        help="redact even a session that looks live. Its context still holds "
-        "the value and may write it back, so the pass is best-effort.",
+        help="redact even a session that looks live. Liveness is detected by "
+        "looking for a running Claude Code process in the transcript's project "
+        "directory, falling back to file age when that cannot be determined. "
+        "A live session's context still holds the value and may write it back, "
+        "so the pass is best-effort.",
     )
 
     tune = p.add_argument_group("tuning")
@@ -2006,7 +2151,8 @@ def _do_redact(
     if live and not args.force:
         print()
         die(
-            f"{live[0].name} looks like a live session.\n"
+            f"{live[0].name} looks like a live session: "
+            f"{liveness_reason(live[0])}.\n"
             "       Its context still holds the value and can write it back "
             "after this pass.\n"
             "       Exit that session and re-run, or pass --force to accept a "

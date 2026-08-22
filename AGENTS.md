@@ -235,10 +235,20 @@ structurally partial and the scanner is the half with no blind spots.
 
 The destructive path. Its tests are the densest in the suite; keep it that way.
 
-**In place, never write-and-rename.** Claude Code holds the active transcript
-open for append. A rename leaves that descriptor writing into an unlinked inode
-and silently loses the rest of the session. `redact_file` opens `r+b`, writes,
+**In place, never write-and-rename.** `redact_file` opens `r+b`, writes,
 truncates — same inode, same mode. `test_inode_is_preserved` pins this.
+
+The original justification for this was wrong and is worth recording, because
+it looked authoritative: I claimed Claude Code holds the transcript open for
+append, so a rename would orphan that descriptor. **Measured, it does not** — a
+live session's process had 32 open fds and none were `.jsonl`, and no transcript
+anywhere on the machine was held open while being actively written. Claude Code
+opens, appends and closes per write.
+
+In place is still right, for a different reason: both approaches race a
+concurrent append, but in place preserves inode, mode and any hard links, and
+does not depend on the destination directory being writable. The real protection
+against a concurrent append is the live-session refusal, not the write strategy.
 
 **A JSONL line without a hit must come out byte-identical.** Lines with a hit
 take the raw path where the value has no JSON-escapable characters, so the rest
@@ -261,6 +271,28 @@ chose". This is what turns coverage from an assumption into a readable result.
 without `--yes`. A plain `StringIO` reports `isatty()` False, so tests exercising
 the prompt need a fake that claims otherwise — otherwise they silently test the
 refusal path instead.
+
+Liveness is **three-state** and its precedence is load-bearing:
+
+| # | Condition | Result |
+|---|---|---|
+| 1 | `$CLAUDE_SESSION_ID` names the transcript | active |
+| 2 | a `claude` process has cwd encoding to its project dir | active |
+| 3 | the probe cannot tell (`None`) | fall back to the mtime window |
+| 4 | no session in that project dir | **not** active, whatever the mtime |
+
+Row 4 is why this exists. Since nothing holds the transcript open, mtime cannot
+distinguish "being written" from "written a moment ago and exited" — so every
+session that quit was unredactable for two minutes, which is exactly the window
+you are in, because noticing a leak is usually why you just quit.
+
+`live_project_dirs()` returns `None` for "cannot tell" and never an empty set
+standing in for it; **collapsing unknown into "nothing live" is the single change
+that would make this tool less safe than a blind timer.** An empty process table
+is treated as unknown, not as "no sessions", because that is what a restricted
+sandbox looks like. Not per-session precise: two sessions in one directory cannot
+be told apart, so every transcript there reads as active — the safe direction.
+Probed once per run and cached; `/proc` on Linux, one batched `lsof` on macOS.
 
 ## Scope of the project
 
