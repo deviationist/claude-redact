@@ -316,6 +316,19 @@ so `@file` references (which Claude Code inlines without calling `Read`), pasted
 content, `Grep`/`Edit` output, MCP results and Bash stdout all bypass it — and
 they bypass it silently. Scanning is how you find out.
 
+## Claude Code skill
+
+`skill/SKILL.md` is an agent skill that fires when Claude Code notices it has
+just read or printed a credential. It tells the agent to reach for this tool
+rather than improvising a `sed` one-liner, to branch on whether the leak is in
+the live session or a past one, to keep the value out of argv and out of its own
+output, and not to open with a rotation lecture the user did not ask for.
+
+```bash
+mkdir -p ~/.claude/skills/redact-transcript
+cp skill/SKILL.md ~/.claude/skills/redact-transcript/
+```
+
 ## Exit codes
 
 | Code | Meaning |
