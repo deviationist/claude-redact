@@ -363,6 +363,15 @@ output, and not to open with a rotation lecture the user did not ask for.
 
 ```bash
 mkdir -p ~/.claude/skills/redact-transcript
+ln -sfn "$PWD/skill/SKILL.md" ~/.claude/skills/redact-transcript/SKILL.md
+```
+
+Symlinking keeps one source of truth, so pulling the repo updates the skill with
+it. If the skill does not show up in a fresh session, copy it instead — Claude
+Code declines to load symlinked files in at least one skill context, and whether
+that extends to personal skills is not documented:
+
+```bash
 cp skill/SKILL.md ~/.claude/skills/redact-transcript/
 ```
 
