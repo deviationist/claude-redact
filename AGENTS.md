@@ -9,7 +9,7 @@ and removes them. Scanning is the default; `--redact` is the destructive path.
 |---|---|
 | `claude-redact` | Executable shim. Wires argv to `main()`, nothing else. |
 | `claude_redact.py` | All logic. Kept importable so the tests can reach it — this is why the shim exists. |
-| `tests/test_claude_redact.py` | 210 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
+| `tests/test_claude_redact.py` | 226 stdlib `unittest` tests. `python3 -m unittest discover -s tests` |
 
 No dependencies, and it should stay that way. PyYAML is used **if importable**
 and otherwise falls through to the line scanner — never add it as a requirement.

@@ -1,5 +1,7 @@
 # claude-redact
 
+[![CI](https://github.com/deviationist/claude-redact/actions/workflows/ci.yml/badge.svg)](https://github.com/deviationist/claude-redact/actions/workflows/ci.yml)
+
 **Find credentials that leaked into Claude Code's local state — then get them out.**
 
 Claude Code stores every session as plaintext JSONL under `~/.claude/projects/`.
@@ -383,7 +385,7 @@ Suitable for a cron audit: `claude-redact --discover --all || notify`.
 python3 -m unittest discover -s tests -v
 ```
 
-69 tests, stdlib only. Several are regression guards for bugs found in
+226 tests, stdlib only. Several are regression guards for bugs found in
 development and are labelled as such.
 
 ## Roadmap

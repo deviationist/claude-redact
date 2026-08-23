@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid re-pushes to a PR).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run every combination to completion. The liveness probe takes a
+      # different path per platform - /proc on Linux, a batched lsof on macOS -
+      # and only one of them ever runs on a given developer's machine. This
+      # matrix is what catches drift in the half you are not looking at.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Oldest supported and newest, plus one in between. The floor is
+        # claimed in the README; this is what keeps that claim honest.
+        python: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Versions
+        run: |
+          python3 --version
+          uname -a
+
+      - name: No dependencies may creep in
+        # The tool is stdlib-only and must stay that way. PyYAML is used when
+        # importable and falls back to the line scanner otherwise; it is never
+        # a requirement.
+        run: |
+          test ! -f requirements.txt || (echo "requirements.txt appeared" && exit 1)
+          test ! -f pyproject.toml   || (echo "pyproject.toml appeared" && exit 1)
+          python3 -c "import claude_redact" 2>&1 | tee /tmp/import.log
+          test ! -s /tmp/import.log || (echo "import produced output" && exit 1)
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Executable runs from a clean checkout
+        run: |
+          ./claude-redact --version
+          ./claude-redact --help > /dev/null
+
+      - name: Filter mode round-trips without touching disk
+        run: |
+          printf 'TZ=Europe/Oslo\nAPP_PASSWORD=Kx7vQm2ZpLr9WtBn\n' \
+            | ./claude-redact --filter > /tmp/filtered.txt
+          grep -q 'TZ=Europe/Oslo' /tmp/filtered.txt
+          grep -q 'APP_PASSWORD=\[REDACTED:APP_PASSWORD\]' /tmp/filtered.txt
+          ! grep -q 'Kx7vQm2ZpLr9WtBn' /tmp/filtered.txt
+
+      - name: Scanning a clean tree exits 0
+        run: |
+          mkdir -p /tmp/fakehome/projects/-tmp-x /tmp/proj
+          printf '{"m":"nothing here"}\n' > /tmp/fakehome/projects/-tmp-x/a.jsonl
+          printf 'APP_PASSWORD=Kx7vQm2ZpLr9WtBn\n' > /tmp/proj/.env
+          CLAUDE_CONFIG_DIR=/tmp/fakehome CLAUDE_PROFILE_SCRIPT=/nonexistent \
+            ./claude-redact --from-file /tmp/proj/.env --all
