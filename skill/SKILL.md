@@ -67,13 +67,62 @@ session. Say so if it matters; do not belabour it.
 
 | Situation | Command |
 |---|---|
-| Value is in a config file | `--from-file <file>` or `--from-dir <dir>` |
+| Value is in a config file on this machine | `--from-file <file>` or `--from-dir <dir>` |
+| Config lives on another host | see [Across hosts](#across-hosts) |
 | User knows the value | `--value -` then paste, Ctrl-D |
 | Nobody knows what leaked | `--discover --all` |
 | Auditing a machine | `claude-redact --discover --all` |
 
 `--from-dir` is preferred: the tool reads the values itself, so nothing
 sensitive passes through your context, the shell history, or `ps`.
+
+## Across hosts
+
+**Redaction happens where the transcript is, which is often not where the
+config is.** Reading a remote file over SSH puts the value in the *local*
+transcript, so `--from-dir` pointed at a local project finds nothing — there is
+no local file holding that value to extract it from.
+
+Two ways round it, in order of preference:
+
+```bash
+# 1. let the remote host extract its own values, and redact locally by value
+ssh <host> "grep -h '^SOME_KEY=' <path>/.env | cut -d= -f2-" \
+  | claude-redact --value - --redact
+
+# 2. or, if claude-redact is installed there, redact on the host that has both
+ssh <host> "cd <project> && claude-redact --redact --dry-run"
+```
+
+Never interpolate the value into a command you then run. It belongs on stdin.
+
+## Stopping the next one
+
+The leak you just cleaned did not have to happen. When about to read something
+that may hold credentials — a `.env`, `docker compose config`, `docker inspect`,
+`msmtprc`, an app log — pipe it through the filter instead:
+
+```bash
+ssh <host> 'cat /srv/app/.env' | claude-redact --filter
+docker compose config            | claude-redact --filter
+```
+
+Key names survive, values do not:
+
+```
+MYSQL_ROOT_PASSWORD=[REDACTED:MYSQL_ROOT_PASSWORD]
+TZ=Europe/Oslo
+```
+
+That is almost always enough. **You rarely need a credential's value — you need
+to know it exists and what it is called**, which is all it takes to write a
+command that dereferences it on the remote side:
+
+```bash
+ssh <host> 'docker exec -i db mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "SHOW DATABASES"'
+```
+
+Suggest the filter once, after cleaning up. Do not lecture about it.
 
 ## Reading the result
 
