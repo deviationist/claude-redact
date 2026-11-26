@@ -643,9 +643,9 @@ def info(msg: str) -> None:
 
 SELF_DIR = Path(__file__).resolve().parent
 
-# Sibling tools in this family (claude-mv, claude-usage) resolve claude-profile
-# through the same three candidates in the same order, so no two of them can
-# disagree about which claude-profile they are talking to:
+# The sibling tool claude-usage resolves claude-profile through the same three
+# candidates in the same order, so the two can never disagree about which
+# claude-profile they are talking to:
 #
 #   $CLAUDE_PROFILE_SCRIPT  ->  claude-profile on PATH  ->  sibling clone
 #
